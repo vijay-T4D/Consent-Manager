@@ -22,8 +22,6 @@
   "required": [
     "_func",
     "user_id",
-    "fiduciary_id",
-    "page",
-    "limit"
+    "fiduciary_id"
   ]
 }
