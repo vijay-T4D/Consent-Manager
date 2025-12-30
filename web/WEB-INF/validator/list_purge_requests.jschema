@@ -29,9 +29,6 @@
     "_func",
     "fiduciary_id",
     "status",
-    "trigger_event",
-    "search",
-    "page",
-    "limit"
+    "search"
   ]
 }
