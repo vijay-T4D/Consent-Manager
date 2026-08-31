@@ -55,6 +55,9 @@
           },
           "timestamp_updated": {
             "type": "string"
+          },
+          "voice_transcript": {
+            "type": "string"
           }
         },
         "required": [

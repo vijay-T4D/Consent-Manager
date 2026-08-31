@@ -8,7 +8,7 @@
     <!-- Load Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com/"></script>
     <script>
-        window.ENV_SERVER_URL = window.ENV_SERVER_URL || 'http://localhost:8080';
+        window.ENV_SERVER_URL = window.ENV_SERVER_URL || window.location.origin;
     </script>
     <style>
         :root {
@@ -264,6 +264,18 @@
 </div>
 
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     // --- Setup & Connectivity ---
     const API_URL = ENV_SERVER_URL + '/api/v1/admin/legal';
     const AUTH_TOKEN = localStorage.getItem('authToken');
@@ -298,7 +310,7 @@
                         <td class="py-4 px-2 font-mono text-[11px] text-slate-500">...${c.id.slice(-12).toUpperCase()}</td>
                         <td class="py-4 px-2 font-bold text-slate-700 text-xs">${c.principal_id}</td>
                         <td class="py-4 px-2 text-slate-600 font-medium text-xs underline decoration-dotted">${c.case_ref || 'GENERAL_TRACE'}</td>
-                        <td class="py-4 px-2 text-slate-400 text-[10px] font-bold">${new Date(c.timestamp).toLocaleString()}</td>
+                        <td class="py-4 px-2 text-slate-400 text-[10px] font-bold">${formatDateTime(c.timestamp)}</td>
                         <td class="py-4 px-2 text-right">
                             <button onclick="viewCertificate('${c.id}')" class="bg-slate-100 text-slate-600 px-3 py-1 rounded-lg font-black hover:bg-teal-600 hover:text-white text-[9px] uppercase tracking-tighter transition-all">Open Viewer</button>
                         </td>

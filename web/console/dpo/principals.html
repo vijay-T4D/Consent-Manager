@@ -284,7 +284,7 @@
     <div class="modal-content">
         <h2 class="text-2xl font-semibold primary-text mb-4">TSI DPDP CMS - Consent Artifact</h2>
         <div class="space-y-4 text-sm">
-            <p class="font-medium">Principal: <code id="modal-record-id" class="text-gray-600"></code></p>
+            <p class="font-medium">Principal: <code id="modal-record-id" class="text-gray-600"></code> <button id="modal-reveal-btn" class="text-xs" title="Reveal — this action is logged">👁</button></p>
             <p class="font-medium">Status: <span id="modal-record-status"></span></p>
 
             <h3 class="font-semibold text-lg mt-4 border-b pb-1">Consent Preferences by Purpose:</h3>
@@ -292,8 +292,13 @@
                 <p class="text-gray-500">Loading details...</p>
             </div>
 
-            <h3 class="font-semibold text-lg mt-4 border-b pb-1">Provenance:</h3>
+            <h3 class="font-semibold text-lg mt-4 border-b pb-1">Origin:</h3>
             <div id="provenance-details" class="policy-detail-card text-xs">
+            </div>
+
+            <h3 class="font-semibold text-lg mt-4 border-b pb-1">Audit Trail:</h3>
+            <div id="audit-trail-details" class="policy-detail-card text-xs">
+                <p class="text-gray-500">Loading...</p>
             </div>
         </div>
 
@@ -313,9 +318,69 @@
         return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;');
     }
 
+    // dd/mm/yyyy — locale-independent, so it doesn't shift to mm/dd/yyyy on a US-locale browser.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     // --- Configuration ---
     const API_URL_CONSENT = '/api/v1/consent';
+    const API_URL_PII = '/api/v1/pii';
     const AUTH_TOKEN = localStorage.getItem('authToken');
+    let revealConfirmedThisSession = false;
+
+    // --- PII reveal helper (shared shape across principals/grievances/compliance) ---
+    // Every reveal is server-side audit-logged (Pii.java, synchronously flushed before
+    // responding) against the operator's own account — the confirm() below just makes that
+    // accountability visible before the click, it isn't the enforcement.
+    async function revealPii(button, source, idOrRef, useRef) {
+        if (!revealConfirmedThisSession) {
+            if (!confirm("This reveal will be recorded in the audit log against your account. Continue?")) return;
+            revealConfirmedThisSession = true;
+        }
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = '…';
+        try {
+            const payload = { "_func": "reveal_user_id", "source": source, "fiduciary_id": localStorage.getItem("fiduciary_id") };
+            if (useRef) payload.user_ref = idOrRef; else payload.id = idOrRef;
+
+            const response = await fetch(API_URL_PII, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (!response.ok) {
+                alert("Reveal failed: " + (result.message || response.status));
+                button.textContent = original;
+                button.disabled = false;
+                return;
+            }
+            const span = button.previousElementSibling;
+            const maskedText = span.textContent;
+            span.textContent = result.user_id;
+            button.textContent = '🙈';
+            // Auto re-mask after 30s so a revealed value doesn't linger on-screen.
+            setTimeout(() => {
+                span.textContent = maskedText;
+                button.textContent = original;
+                button.disabled = false;
+            }, 30000);
+        } catch (e) {
+            alert("Reveal failed.");
+            button.textContent = original;
+            button.disabled = false;
+        }
+    }
+    window.revealPii = revealPii;
     if (localStorage.getItem('role') === 'OPERATOR') {
         document.querySelectorAll('a[href="policies.html"], a[href="settings.html"], a[href="team.html"]').forEach(el => el.remove());
     }
@@ -367,7 +432,7 @@
         row.innerHTML = `
             <td class="px-4 py-3 text-sm font-mono text-gray-700">...${esc(record.id.slice(-8))}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${esc(record.policy_id)} (v${esc(record.policy_version)})</td>
-            <td class="px-4 py-3 text-sm text-gray-600">${esc(new Date(record.timestamp).toLocaleString())}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${esc(formatDateTime(record.timestamp))}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${esc(record.consent_mechanism)}</td>
             <td class="px-4 py-3 text-sm">${createStatusBadge(record.consent_status_general, isActive)}</td>
             <td class="px-4 py-3 text-sm font-bold text-slate-500">${isActive ? 'Yes' : 'No'}</td>
@@ -385,20 +450,26 @@
     function createRecentPrincipalRow(principal) {
         const row = document.createElement('tr');
         row.innerHTML = `
-            <td class="px-4 py-3 text-sm font-mono text-gray-700">${esc(principal.user_id)}</td>
+            <td class="px-4 py-3 text-sm font-mono text-gray-700">
+                <span>${esc(principal.user_id)}</span>
+                <button class="reveal-btn ml-1 text-xs" title="Reveal — this action is logged">👁</button>
+            </td>
             <td class="px-4 py-3 text-sm text-gray-600">${esc(principal.last_consent_mechanism || 'N/A')}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${esc(principal.age_category || 'N/A')}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${esc(principal.verification_status || 'N/A')}</td>
-            <td class="px-4 py-3 text-sm text-gray-600">${esc(new Date(principal.created_at).toLocaleDateString())}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${esc(formatDate(principal.created_at))}</td>
             <td class="px-4 py-3 text-sm">
                 <button class="view-recent-principal-btn text-indigo-600 hover:text-indigo-900 font-bold text-sm">View</button>
             </td>
         `;
         const btn = row.querySelector('.view-recent-principal-btn');
+        // user_id is masked server-side — drill-down uses the opaque user_ref handle instead,
+        // never the plaintext (which this page never receives unless explicitly revealed).
         btn.addEventListener('click', () => {
-            principalIdInput.value = principal.user_id;
-            loadConsentHistory(principal.user_id);
+            principalIdInput.value = '';
+            loadConsentHistory(principal.user_ref, true);
         });
+        row.querySelector('.reveal-btn').addEventListener('click', (e) => revealPii(e.target, 'data_principal', principal.user_ref, true));
         return row;
     }
 
@@ -422,19 +493,28 @@
         }
     }
 
-    async function loadConsentHistory(principalIdentifier) {
+    // Tracks whichever identifier this page currently holds — the plaintext (if the DPO typed it
+    // into the search box themselves) or only an opaque user_ref (if it came from the masked
+    // Recent Principals list). Needed so actions like erasure can reveal-then-act when only a
+    // ref is known.
+    let currentUserId = null;
+    let currentUserRef = null;
+
+    async function loadConsentHistory(principalIdentifier, isRef) {
         recentPrincipalsCard.classList.add('hidden');
         consentHistoryCard.classList.add('hidden');
         principalStatusCard.classList.add('hidden');
         consentTableBody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-gray-500">Searching...</td></tr>`;
         searchMessage.classList.add('hidden');
+        currentUserId = isRef ? null : principalIdentifier;
+        currentUserRef = isRef ? principalIdentifier : null;
 
         try {
             const payload = {
                 "_func": "list_consent_history",
-                "user_id": principalIdentifier,
                 "fiduciary_id": localStorage.getItem("fiduciary_id")
             };
+            if (isRef) payload.user_ref = principalIdentifier; else payload.user_id = principalIdentifier;
 
             const response = await fetch(API_URL_CONSENT, {
                 method: 'POST',
@@ -454,24 +534,33 @@
             if (Array.isArray(records) && records.length > 0) {
                 consentTableBody.innerHTML = '';
                 const latest = records[0];
+                // Remember the ref regardless of how we got here — needed for reveal-then-act
+                // (see initiateErasurePurge) when only a ref, not the plaintext, is known.
+                if (!currentUserRef && latest.user_ref) currentUserRef = latest.user_ref;
                 overallStatusBadge.innerHTML = createStatusBadge(latest.consent_status_general, latest.is_active_consent);
 
                 if (latest.consent_mechanism !== 'ERASURE_REQUEST') {
                     mainInitiateErasureBtn.classList.remove('hidden');
-                    mainInitiateErasureBtn.onclick = () => initiateErasurePurge(principalIdentifier);
+                    mainInitiateErasureBtn.onclick = () => initiateErasurePurge();
                 } else {
                     mainInitiateErasureBtn.classList.add('hidden');
                 }
 
                 principalStatusCard.classList.remove('hidden');
                 records.forEach(record => {
-                    consentTableBody.appendChild(createHistoryRow(record, principalIdentifier));
+                    consentTableBody.appendChild(createHistoryRow(record, currentUserId || record.user_id));
                 });
-                principalDisplayId.textContent = principalIdentifier;
+                // Shows the plaintext only if the DPO typed it themselves (self-supplied, not a
+                // reveal); otherwise the masked value the server already returned.
+                principalDisplayId.textContent = currentUserId || latest.user_id;
                 consentHistoryCard.classList.remove('hidden');
             } else {
+                // Don't fall back to showing everyone else's (unrelated) Recent Principals list
+                // after a failed targeted search — that read as "the system just showed me other
+                // people instead of what I was looking for." Just say clearly that this specific
+                // identifier wasn't found, and stop there.
                 consentTableBody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-gray-500">No records found.</td></tr>`;
-                recentPrincipalsCard.classList.remove('hidden');
+                searchMessage.classList.remove('hidden');
             }
         } catch (error) {
             consentTableBody.innerHTML = `<tr><td colspan="7" class="p-4 text-center text-red-600">Error loading data.</td></tr>`;
@@ -499,40 +588,158 @@
 
             if (response.ok && record) {
                 modalRecordId.textContent = userId;
+                // A single reveal on a consent_record unmasks BOTH principal and IP together (one
+                // audited action covering the whole record) — see Pii.java's CONSENT_RECORD_FIELDS.
+                document.getElementById('modal-reveal-btn').onclick = (e) => revealConsentRecordDetails(e.target, recordId);
                 modalRecordStatus.innerHTML = createStatusBadge(record.consent_status_general, record.is_active_consent);
 
                 provenanceDetails.innerHTML = `
                     <p><strong>Policy Ref:</strong> ${esc(record.policy_id)} (v${esc(record.policy_version || '—')})</p>
                     ${record.ropa_entry_id ? `<p><strong>ROPA Entry:</strong> ${esc(record.ropa_activity_name || record.ropa_entry_id)}</p>` : ''}
-                    <p><strong>Time:</strong> ${esc(new Date(record.timestamp).toLocaleString())} (${esc(record.consent_mechanism)})</p>
-                    <p><strong>IP:</strong> ${esc(record.ip_address || 'N/A')} | <strong>User Agent:</strong> ${esc(record.user_agent || 'N/A')}</p>
+                    <p><strong>Time:</strong> ${esc(formatDateTime(record.timestamp))} (${esc(record.consent_mechanism)})</p>
+                    <p><strong>IP:</strong> <span id="modal-ip-address">${esc(record.ip_address || 'N/A')}</span>
+                       <button id="modal-ip-reveal-btn" class="text-xs" title="Reveal — this action is logged">👁</button>
+                       | <strong>User Agent:</strong> ${esc(record.user_agent || 'N/A')}</p>
                 `;
+                document.getElementById('modal-ip-reveal-btn').onclick = (e) => revealConsentRecordDetails(e.target, recordId);
 
                 let detailsHtml = '';
                 const preferences = record.data_point_consents;
 
                 for (const purposeId in preferences) {
                     const purpose = preferences[purposeId].purpose_agreed_to;
+                    const dataPointId = preferences[purposeId].data_point_id;
                     const status = preferences[purposeId].consent_granted;
                     const statusBadge = status === true
                         ? `<span class="text-green-600 font-bold">GRANTED</span>`
                         : `<span class="text-red-600 font-bold">DENIED</span>`;
+                    // Revoking an already-DENIED purpose is a no-op — only offer it for GRANTED ones.
+                    const revokeBtn = status === true
+                        ? `<button class="revoke-purpose-btn ml-3 text-xs text-red-600 hover:text-red-800 font-semibold underline" data-datapoint="${esc(dataPointId)}" data-purpose="${esc(purpose)}">Revoke</button>`
+                        : '';
 
                     detailsHtml += `
                         <div class="policy-detail-item">
                             <p class="text-gray-800 font-medium">${esc(purpose)}:</p>
-                            <p class="ml-4">${statusBadge}</p>
+                            <p class="ml-4">${statusBadge}${revokeBtn}</p>
                         </div>
                     `;
                 }
                 granularConsentDetails.innerHTML = detailsHtml || '<p class="text-gray-500">No granular purposes recorded.</p>';
+                granularConsentDetails.querySelectorAll('.revoke-purpose-btn').forEach(btn => {
+                    btn.addEventListener('click', () => revokePurpose(recordId, btn.dataset.datapoint, btn.dataset.purpose));
+                });
             }
         } catch (error) {
             granularConsentDetails.innerHTML = `<p class="text-red-600">Error fetching details.</p>`;
         }
+
+        loadConsentAuditTrail(recordId);
     }
 
-    async function initiateErasurePurge(userId) {
+    // Reveals BOTH principal and IP for a consent_record in one audited call (Pii.java returns
+    // both fields together from a single reveal). Updates whichever span the click originated
+    // from, and the other one too, then re-masks both together after 30s.
+    async function revealConsentRecordDetails(button, recordId) {
+        if (!revealConfirmedThisSession) {
+            if (!confirm("This reveal will be recorded in the audit log against your account. Continue?")) return;
+            revealConfirmedThisSession = true;
+        }
+        const principalBtn = document.getElementById('modal-reveal-btn');
+        const ipBtn = document.getElementById('modal-ip-reveal-btn');
+        const principalSpan = modalRecordId;
+        const ipSpan = document.getElementById('modal-ip-address');
+        const originalPrincipalText = principalSpan.textContent;
+        const originalIpText = ipSpan ? ipSpan.textContent : null;
+        [principalBtn, ipBtn].forEach(b => { if (b) b.disabled = true; });
+        button.textContent = '…';
+        try {
+            const response = await fetch(API_URL_PII, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({ "_func": "reveal_user_id", "source": "consent_record", "id": recordId, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+            });
+            const result = await response.json();
+            if (!response.ok) {
+                alert("Reveal failed: " + (result.message || response.status));
+                button.textContent = '👁';
+                [principalBtn, ipBtn].forEach(b => { if (b) b.disabled = false; });
+                return;
+            }
+            principalSpan.textContent = result.user_id;
+            if (ipSpan) ipSpan.textContent = result.ip_address;
+            if (principalBtn) principalBtn.textContent = '🙈';
+            if (ipBtn) ipBtn.textContent = '🙈';
+            setTimeout(() => {
+                principalSpan.textContent = originalPrincipalText;
+                if (ipSpan) ipSpan.textContent = originalIpText;
+                if (principalBtn) { principalBtn.textContent = '👁'; principalBtn.disabled = false; }
+                if (ipBtn) { ipBtn.textContent = '👁'; ipBtn.disabled = false; }
+            }, 30000);
+        } catch (e) {
+            alert("Reveal failed.");
+            button.textContent = '👁';
+            [principalBtn, ipBtn].forEach(b => { if (b) b.disabled = false; });
+        }
+    }
+
+    // Independent, tamper-evident cross-check: pulls the audit_logs entry for this consent (not
+    // the live consent_records row) so a DPO can see what was actually logged as consented at
+    // the time, verified via the hash chain — see Consent.getConsentAuditEntryFromDb.
+    async function loadConsentAuditTrail(recordId) {
+        const el = document.getElementById('audit-trail-details');
+        el.innerHTML = '<p class="text-gray-500">Loading...</p>';
+        try {
+            const response = await fetch(API_URL_CONSENT, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({ "_func": "get_consent_audit_trail", "record_id": recordId, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+            });
+            if (!response.ok) {
+                el.innerHTML = '<p class="text-gray-500">No matching audit log entry found (older records predate this cross-reference).</p>';
+                return;
+            }
+            const entry = await response.json();
+            let purposesHtml = '';
+            (entry.data_point_consents || []).forEach(dp => {
+                const badge = dp.consent_granted === true
+                    ? '<span class="text-green-600 font-bold">GRANTED</span>'
+                    : '<span class="text-red-600 font-bold">DENIED</span>';
+                purposesHtml += `<p class="ml-4">${esc(dp.purpose_agreed_to)}: ${badge}</p>`;
+            });
+            el.innerHTML = `
+                <p><strong>Logged at:</strong> ${esc(formatDateTime(entry.timestamp))}</p>
+                <p><strong>Hash:</strong> <code class="text-[10px] break-all">${esc(entry.current_hash)}</code></p>
+                <p class="mt-2 font-medium">What the audit log recorded as consented:</p>
+                ${purposesHtml || '<p class="ml-4 text-gray-500">No purposes recorded.</p>'}
+            `;
+        } catch (e) {
+            el.innerHTML = '<p class="text-red-600">Error fetching audit trail.</p>';
+        }
+    }
+
+    // erasure_request (unlike list_consent_history/get_active_consent) only accepts a real
+    // user_id — it's a write path, not one of the read endpoints Consent.java resolves a
+    // user_ref against. If this page only holds a ref (the DPO drilled down from the masked
+    // Recent Principals list and never typed/revealed the plaintext), reveal it first — this is
+    // exactly the "on need basis, audited" case the reveal endpoint exists for.
+    async function initiateErasurePurge() {
+        let userId = currentUserId;
+        if (!userId && currentUserRef) {
+            try {
+                const revealResp = await fetch(API_URL_PII, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                    body: JSON.stringify({ "_func": "reveal_user_id", "source": "data_principal", "user_ref": currentUserRef, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+                });
+                const revealResult = await revealResp.json();
+                if (!revealResp.ok) { alert("Could not resolve principal identity: " + (revealResult.message || revealResp.status)); return; }
+                userId = revealResult.user_id;
+                currentUserId = userId; // cache — the operator's already-audited reveal shouldn't be repeated on retry
+            } catch (e) { alert("Could not resolve principal identity."); return; }
+        }
+        if (!userId) { alert("No principal identifier available."); return; }
+
         if (confirm(`Confirm: Initiate full Data Erasure/Purge workflow for Data Principal ID ${userId}?`)) {
             try {
                 const response = await fetch(API_URL_CONSENT, {
@@ -548,10 +755,56 @@
                 });
                 if (response.ok) {
                     alert("Erasure request submitted.");
-                    loadConsentHistory(userId);
+                    loadConsentHistory(userId, false);
                 }
             } catch (e) { alert("Error initiating erasure."); }
         }
+    }
+
+    // Revokes ONE purpose on a consent record — e.g. resolving a grievance that asked to stop
+    // just one specific use of their data, without withdrawing everything (that's what the
+    // "Initiate Erasure Request" button above is for). Same reveal-then-act pattern as erasure:
+    // withdraw_consent needs a real user_id, not an opaque user_ref.
+    async function revokePurpose(recordId, dataPointId, purposeLabel) {
+        let userId = currentUserId;
+        if (!userId && currentUserRef) {
+            try {
+                const revealResp = await fetch(API_URL_PII, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                    body: JSON.stringify({ "_func": "reveal_user_id", "source": "data_principal", "user_ref": currentUserRef, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+                });
+                const revealResult = await revealResp.json();
+                if (!revealResp.ok) { alert("Could not resolve principal identity: " + (revealResult.message || revealResp.status)); return; }
+                userId = revealResult.user_id;
+                currentUserId = userId;
+            } catch (e) { alert("Could not resolve principal identity."); return; }
+        }
+        if (!userId) { alert("No principal identifier available."); return; }
+
+        if (!confirm(`Confirm: Revoke consent for purpose "${purposeLabel}" only? Every other granted purpose on this record is unaffected.`)) return;
+
+        try {
+            const response = await fetch(API_URL_CONSENT, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({
+                    "_func": "withdraw_consent",
+                    "user_id": userId,
+                    "purpose_ids": [dataPointId],
+                    "reason": "DPO revoked a single purpose (e.g. via grievance resolution).",
+                    "fiduciary_id": localStorage.getItem("fiduciary_id")
+                })
+            });
+            if (response.ok) {
+                alert(`Purpose "${purposeLabel}" revoked.`);
+                closeModal();
+                loadConsentHistory(userId, false);
+            } else {
+                const err = await response.json();
+                alert("Failed to revoke purpose: " + (err.message || response.status));
+            }
+        } catch (e) { alert("Error revoking purpose."); }
     }
 
     function handleLogout() {

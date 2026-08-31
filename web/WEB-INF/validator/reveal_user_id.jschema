@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "reveal_user_id",
+  "type": "object",
+  "required": ["_func", "source", "fiduciary_id"],
+  "properties": {
+    "_func": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["consent_record", "grievance", "purge_request", "data_principal", "parental_verification"]
+    },
+    "fiduciary_id": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "user_ref": {
+      "type": "string"
+    }
+  }
+}

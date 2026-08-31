@@ -189,7 +189,7 @@
 
         <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-3">
             <div class="flex gap-3 flex-1 max-w-xl">
-                <input type="text" id="principal-search" placeholder="Search by Data Principal (User ID)..." class="p-2 border border-gray-300 rounded-md text-sm w-full outline-none focus:ring-2 focus:ring-teal-600 focus:border-transparent">
+                <input type="text" id="principal-search" placeholder="Search by exact Data Principal ID, or a keyword in context details..." class="p-2 border border-gray-300 rounded-md text-sm w-full outline-none focus:ring-2 focus:ring-teal-600 focus:border-transparent">
                 <select id="action-filter" class="p-2 border border-gray-300 rounded-md text-sm bg-white">
                     <option value="ALL">All Actions</option>
                     <option value="CONSENT_GIVEN">Consent Given</option>
@@ -241,6 +241,18 @@
 </div>
 
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     // --- Configuration ---
     const API_URL_AUDIT = '/api/v1/admin/audit';
     const AUTH_TOKEN = localStorage.getItem('authToken');
@@ -293,11 +305,11 @@
 
         row.innerHTML = `
             <td class="px-4 py-3 whitespace-nowrap">
-                <p class="text-sm font-semibold text-gray-700">${new Date(log.timestamp).toLocaleDateString()}</p>
+                <p class="text-sm font-semibold text-gray-700">${formatDate(log.timestamp)}</p>
                 <p class="text-[10px] text-gray-400 font-bold uppercase">${new Date(log.timestamp).toLocaleTimeString()}</p>
             </td>
             <td class="px-4 py-3 whitespace-nowrap">
-                <span class="text-sm font-mono text-gray-600 bg-gray-100 px-2 py-0.5 rounded">${log.user_id}</span>
+                <span class="text-sm font-mono text-gray-600 bg-gray-100 px-2 py-0.5 rounded" title="One-way hash — this is not reversible, there is nothing to reveal.">${log.user_id}</span>
             </td>
             <td class="px-4 py-3 whitespace-nowrap">
                 <span class="text-[11px] font-bold px-2 py-1 rounded border ${actionClass}">${log.audit_action}</span>
@@ -394,7 +406,7 @@
 
         // Prepare data for Excel (Flattening objects for spreadsheet readability)
         const dataForExcel = currentLogs.map(log => ({
-            "Timestamp": new Date(log.timestamp).toLocaleString(),
+            "Timestamp": formatDateTime(log.timestamp),
             "Principal ID": log.user_id,
             "Action Type": log.audit_action,
             "Actor Type": log.service_type,

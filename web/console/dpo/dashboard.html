@@ -218,6 +218,20 @@
 </main>
 
 <script>
+    // dd/mm/yyyy formatting for record dates (matches the rest of the console — locale-based
+    // toLocaleDateString() would render mm/dd/yyyy for a browser set to en-US, ambiguous for
+    // an India-focused compliance app).
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     const API_URL_DASHBOARD = '/api/v1/admin/admindash';
     const AUTH_TOKEN = localStorage.getItem('authToken');
     const FIDUCIARY_ID = localStorage.getItem('fiduciary_id');
@@ -323,10 +337,10 @@
                 tbody.innerHTML = grievances.map(g => {
                     const isOverdue = g.days_left < 0;
                     return `
-                        <tr class="hover:bg-slate-50 transition-colors">
+                        <tr class="hover:bg-slate-50 transition-colors cursor-pointer" onclick="window.location.href='grievances.html?id=${g.grievance_id}'">
                             <td class="px-4 py-3 font-mono text-xs text-slate-500">...${g.grievance_id.slice(-8)}</td>
                             <td class="px-4 py-3 font-bold text-slate-700">${g.type.replace(/_/g, ' ')}</td>
-                            <td class="px-4 py-3 text-slate-500">${new Date(g.submission_timestamp).toLocaleDateString()}</td>
+                            <td class="px-4 py-3 text-slate-500">${formatDate(g.submission_timestamp)}</td>
                             <td class="px-4 py-3 font-semibold ${isOverdue ? 'text-red-600' : 'text-slate-600'}">
                                 ${isOverdue ? Math.abs(g.days_left) + ' days OVERDUE' : g.days_left + ' days left'}
                             </td>

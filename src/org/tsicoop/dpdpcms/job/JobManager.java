@@ -7,6 +7,8 @@ import org.json.simple.JSONObject;
 import org.tsicoop.dpdpcms.ces.CESService;
 import org.tsicoop.dpdpcms.framework.PoolDB;
 import org.tsicoop.dpdpcms.framework.SystemConfig;
+import org.tsicoop.dpdpcms.framework.DbEncryption;
+import org.tsicoop.dpdpcms.framework.InputProcessor;
 import org.tsicoop.dpdpcms.service.v1.Audit;
 
 import java.io.File;
@@ -35,6 +37,14 @@ public class JobManager implements ServletContextListener {
             : "/var/lib/tsi/exports/";
     private static final int BATCH_SIZE = 10; // Fixed number of principals to fetch at a time
     private static final String NIGHTLY_CES_JOB_NAME = "CES_NIGHTLY_FULL";
+    // Policy number, not a secret — default-with-override rather than DbEncryption's fail-fast
+    // pattern. How long audit_logs history stays in the live partitioned table before its
+    // partition gets detached (never deleted) to a standalone "_archive" table. See
+    // 15_partition_audit_logs.sql / 16_audit_archive_registry.sql for the schema this operates on.
+    private static final int AUDIT_RETENTION_MONTHS = System.getenv("AUDIT_RETENTION_MONTHS") != null
+            ? Integer.parseInt(System.getenv("AUDIT_RETENTION_MONTHS"))
+            : 24;
+    private static final java.util.regex.Pattern AUDIT_PARTITION_NAME = java.util.regex.Pattern.compile("^audit_logs_y(\\d{4})$");
 
     @Override
     public void contextInitialized(ServletContextEvent sce) {
@@ -49,6 +59,105 @@ public class JobManager implements ServletContextListener {
 
         // Schedule the polling task every 2 minutes
         scheduler.scheduleAtFixedRate(this::checkAndExecuteJobs, 1, 2, TimeUnit.MINUTES);
+
+        // Audit-log partition maintenance — cheap no-op most days, only acts once a year's
+        // partition actually crosses the retention boundary or a new year needs a partition ahead
+        // of the Dec 31 -> Jan 1 rollover.
+        scheduler.scheduleAtFixedRate(this::checkAndArchiveAuditPartitions, 1, 24, TimeUnit.HOURS);
+    }
+
+    /**
+     * Audit-log retention: ensures the partition for next year already exists (so inserts never
+     * fail across a year rollover), then detaches — never deletes — any yearly partition whose
+     * entire range is older than AUDIT_RETENTION_MONTHS, renaming it to a standalone
+     * "<name>_archive" table and recording it in audit_log_archive_registry. Archived data stays
+     * fully intact and queryable; Audit.getArchivedTableNames() is how Audit.java/Legal.java find
+     * it again for searches/evidence certificates that span the retention boundary.
+     */
+    private void checkAndArchiveAuditPartitions() {
+        PoolDB pool = null;
+        Connection conn = null;
+        try {
+            pool = new PoolDB();
+            conn = pool.getConnection();
+
+            int nextYear = LocalDate.now().getYear() + 1;
+            ensureAuditYearPartitionExists(conn, nextYear);
+
+            LocalDate cutoff = LocalDate.now().minusMonths(AUDIT_RETENTION_MONTHS);
+
+            List<String> currentPartitions = new ArrayList<>();
+            try (PreparedStatement pstmt = conn.prepareStatement(
+                    "SELECT c.relname FROM pg_inherits i " +
+                            "JOIN pg_class c ON i.inhrelid = c.oid " +
+                            "JOIN pg_class p ON i.inhparent = p.oid " +
+                            "WHERE p.relname = 'audit_logs'");
+                 ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) currentPartitions.add(rs.getString("relname"));
+            }
+
+            for (String partitionName : currentPartitions) {
+                java.util.regex.Matcher m = AUDIT_PARTITION_NAME.matcher(partitionName);
+                if (!m.matches()) continue; // already archived (renamed with _archive suffix) or not ours
+                int year = Integer.parseInt(m.group(1));
+                LocalDate periodStart = LocalDate.of(year, 1, 1);
+                LocalDate periodEnd = LocalDate.of(year + 1, 1, 1);
+                if (!periodEnd.isAfter(cutoff)) { // the whole partition's range is before the cutoff
+                    archiveAuditPartition(conn, partitionName, periodStart, periodEnd);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[JobManager] Audit partition maintenance failed: " + e.getMessage());
+        } finally {
+            if (pool != null) try { pool.cleanup(null, null, conn); } catch (Exception ignored) {}
+        }
+    }
+
+    private void ensureAuditYearPartitionExists(Connection conn, int year) throws SQLException {
+        String name = "audit_logs_y" + year;
+        try (PreparedStatement check = conn.prepareStatement(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?")) {
+            check.setString(1, name);
+            try (ResultSet rs = check.executeQuery()) {
+                if (rs.next()) return; // already exists
+            }
+        }
+        String from = year + "-01-01";
+        String to = (year + 1) + "-01-01";
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE " + name + " PARTITION OF audit_logs FOR VALUES FROM ('" + from + "') TO ('" + to + "')");
+        }
+        System.out.println("[JobManager] Created audit_logs partition " + name + " ahead of the year rollover.");
+    }
+
+    /**
+     * DETACH (never DELETE) + rename + register. The renamed table falls out of the
+     * AUDIT_PARTITION_NAME pattern so it's never reconsidered by this method again.
+     */
+    private void archiveAuditPartition(Connection conn, String partitionName, LocalDate periodStart, LocalDate periodEnd) throws SQLException {
+        String archivedName = partitionName + "_archive";
+
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("ALTER TABLE audit_logs DETACH PARTITION " + partitionName);
+            stmt.execute("ALTER TABLE " + partitionName + " RENAME TO " + archivedName);
+        }
+
+        int rowCount = 0;
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT count(*) FROM " + archivedName)) {
+            if (rs.next()) rowCount = rs.getInt(1);
+        }
+
+        try (PreparedStatement ins = conn.prepareStatement(
+                "INSERT INTO audit_log_archive_registry (partition_name, period_start, period_end, row_count) VALUES (?, ?, ?, ?)")) {
+            ins.setString(1, archivedName);
+            ins.setObject(2, java.sql.Timestamp.valueOf(periodStart.atStartOfDay()));
+            ins.setObject(3, java.sql.Timestamp.valueOf(periodEnd.atStartOfDay()));
+            ins.setInt(4, rowCount);
+            ins.executeUpdate();
+        }
+
+        System.out.println("[JobManager] Archived audit_logs partition " + partitionName + " -> " + archivedName + " (" + rowCount + " rows, never deleted).");
     }
 
     private void checkAndExecuteJobs() {
@@ -232,11 +341,13 @@ public class JobManager implements ServletContextListener {
             if (notificationType == null) notificationType = "BREACH_NOTIFICATION";
 
             pstmt = conn.prepareStatement(
-                    "INSERT INTO breach_affected_principals (breach_id, user_id) VALUES (?, ?) " +
-                            "ON CONFLICT (breach_id, user_id) DO NOTHING");
+                    "INSERT INTO breach_affected_principals (breach_id, user_id_enc, user_id_hmac) VALUES (?, " +
+                            DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ") " +
+                            "ON CONFLICT (breach_id, user_id_hmac) DO NOTHING");
             for (String userId : userIds) {
                 pstmt.setObject(1, breachId);
-                pstmt.setString(2, userId);
+                int idx = DbEncryption.bindEncrypt(pstmt, 2, userId);
+                DbEncryption.bindHmac(pstmt, idx, userId);
                 pstmt.addBatch();
             }
             pstmt.executeBatch();
@@ -329,49 +440,66 @@ public class JobManager implements ServletContextListener {
     private void executeExportJob(UUID fiduciaryId, UUID jobId, String subtype, Date start, Date end) throws Exception {
         System.out.println("[JobManager] Executing Export: " + subtype+"-"+start+"-"+end);
         String sql = "";
+        // Number of DbEncryption.decryptCol(...) fragments used in the SQL below for this subtype —
+        // each one consumes one leading '?' bind slot (the decrypt key) that must be bound before
+        // fiduciary_id/start/end. This is the DPO's authorised bulk-export path (see
+        // executeExportJob's caller for the operator-role gate) — it deliberately emits plaintext,
+        // unlike every console/API read path elsewhere, which masks by default.
+        int decryptKeyCount = 0;
 
         // Define SQL based on subtype
         switch (subtype.toUpperCase()) {
             case "CONSENT":
-                sql = "SELECT user_id as principal, policy_id, jurisdiction, language_selected as language, consent_mechanism as action, ip_address, user_agent, data_point_consents as consents, is_active_consent as active, created_at, last_updated_at, verification_log_id FROM consent_records WHERE fiduciary_id=? AND timestamp BETWEEN ? AND ?";
+                sql = "SELECT " + DbEncryption.decryptCol("user_id_enc") + " as principal, policy_id, jurisdiction, language_selected as language, consent_mechanism as action, " + DbEncryption.decryptCol("ip_address_enc") + " as ip_address, user_agent, data_point_consents as consents, is_active_consent as active, created_at, last_updated_at, verification_log_id FROM consent_records WHERE fiduciary_id=? AND timestamp BETWEEN ? AND ?";
+                decryptKeyCount = 2;
                 break;
             case "PRINCIPAL":
-                sql = "SELECT user_id as principal, created_at, last_consent_mechanism as last_action, last_ces_run FROM data_principal WHERE fiduciary_id=? AND created_at BETWEEN ? AND ?";
+                sql = "SELECT " + DbEncryption.decryptCol("user_id_enc") + " as principal, created_at, last_consent_mechanism as last_action, last_ces_run FROM data_principal WHERE fiduciary_id=? AND created_at BETWEEN ? AND ?";
+                decryptKeyCount = 1;
                 break;
             case "COMPLIANCE":
-                sql = "SELECT pr.user_id, pr.purpose_id, COALESCE(a.name, 'No Linked Processor') AS name, pr.trigger_event, pr.status, pr.initiated_at, pr.details FROM purge_requests pr LEFT JOIN apps a ON pr.app_id = a.id WHERE pr.fiduciary_id=? AND pr.initiated_at BETWEEN ? AND ?";
+                sql = "SELECT " + DbEncryption.decryptCol("pr.user_id_enc") + " as user_id, pr.purpose_id, COALESCE(a.name, 'No Linked Processor') AS name, pr.trigger_event, pr.status, pr.initiated_at, pr.details FROM purge_requests pr LEFT JOIN apps a ON pr.app_id = a.id WHERE pr.fiduciary_id=? AND pr.initiated_at BETWEEN ? AND ?";
+                decryptKeyCount = 1;
                 break;
             case "GRIEVANCE":
-                sql = "SELECT user_id as principal, type, subject, description, submission_timestamp, status, resolution_details FROM grievances WHERE fiduciary_id=? AND submission_timestamp BETWEEN ? AND ?";
+                sql = "SELECT " + DbEncryption.decryptCol("user_id_enc") + " as principal, type, subject, description, submission_timestamp, status, resolution_details FROM grievances WHERE fiduciary_id=? AND submission_timestamp BETWEEN ? AND ?";
+                decryptKeyCount = 1;
                 break;
             case "AUDIT":
+                // audit_logs.user_id is a one-way hash (LookupHasher), not pgcrypto-encrypted —
+                // never touched by this feature (see 13_principal_pii_encryption.sql header). No
+                // decrypt fragment applies here; exported as-is, same as every other audit_logs read.
                 sql = "SELECT timestamp, user_id as principal, audit_action as action, context_details FROM audit_logs WHERE fiduciary_id=? AND timestamp BETWEEN ? AND ?";
+                decryptKeyCount = 0;
                 break;
             case "PARENT_CONSENT":
-                sql = "SELECT id, verified_at, child_principal_id as principal, guardian_principal_id as guardian, verification_mechanism, provider_name, verification_ref_id, proof_metadata FROM parental_verification_logs WHERE fiduciary_id=? AND verified_at BETWEEN ? AND ?";
+                sql = "SELECT id, verified_at, " + DbEncryption.decryptCol("child_principal_id_enc") + " as principal, " + DbEncryption.decryptCol("guardian_principal_id_enc") + " as guardian, verification_mechanism, provider_name, " + DbEncryption.decryptCol("verification_ref_id_enc") + " as verification_ref_id, " + DbEncryption.decryptCol("proof_metadata_enc") + " as proof_metadata FROM parental_verification_logs WHERE fiduciary_id=? AND verified_at BETWEEN ? AND ?";
+                decryptKeyCount = 4;
                 break;
             case "ADMIN_LOGS":
                 sql = "SELECT timestamp, user_id as user, audit_action as action, context_details as details FROM audit_logs WHERE service_type='ADMIN_CONSOLE' AND fiduciary_id=? AND timestamp BETWEEN ? AND ? ORDER BY timestamp asc";
+                decryptKeyCount = 0;
                 break;
             case "ROPA_REPORT":
                 sql = "SELECT r.activity_name, r.source_purpose_id as purpose_id, r.purpose, r.legal_basis, " +
                       "cp.id as policy_id, " +
-                      "cr.user_id as data_principal, cr.consent_status_general as consent_status, " +
+                      "cr.data_principal, cr.consent_status_general as consent_status, " +
                       "cr.consent_mechanism, " +
                       "cr.timestamp as consent_timestamp, cr.jurisdiction, cr.language_selected " +
                       "FROM ropa_entries r " +
                       "JOIN consent_policies cp ON r.linked_policy_ids @> jsonb_build_array(cp.id) " +
                       "JOIN LATERAL (" +
-                      "  SELECT DISTINCT ON (cri.user_id) cri.user_id, cri.consent_status_general, cri.consent_mechanism, " +
+                      "  SELECT DISTINCT ON (cri.user_id_hmac) " + DbEncryption.decryptCol("cri.user_id_enc") + " as data_principal, cri.consent_status_general, cri.consent_mechanism, " +
                       "         cri.timestamp, cri.jurisdiction, cri.language_selected " +
                       "  FROM consent_records cri, jsonb_array_elements(cri.data_point_consents) AS dp " +
                       "  WHERE cri.policy_id = cp.id AND cri.fiduciary_id = r.fiduciary_id " +
                       "    AND dp->>'data_point_id' = r.source_purpose_id " +
-                      "  ORDER BY cri.user_id, cri.created_at DESC" +
+                      "  ORDER BY cri.user_id_hmac, cri.created_at DESC" +
                       ") cr ON TRUE " +
                       "WHERE r.fiduciary_id = ? AND r.status = 'active' " +
                       "AND cr.timestamp BETWEEN ? AND ? " +
                       "ORDER BY r.id, cr.timestamp DESC";
+                decryptKeyCount = 1; // the decrypt fragment sits inside the LATERAL subquery, evaluated once per outer row — still just 1 '?' in the SQL text
                 break;
             default:
                 throw new Exception("Unknown Export Subtype: " + subtype);
@@ -388,9 +516,13 @@ public class JobManager implements ServletContextListener {
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, fiduciaryId);
-            pstmt.setTimestamp(2, new Timestamp(start.getTime()));
-            pstmt.setTimestamp(3, new Timestamp(end.getTime()));
+            int idx = 1;
+            for (int k = 0; k < decryptKeyCount; k++) {
+                idx = DbEncryption.bindKey(pstmt, idx);
+            }
+            pstmt.setObject(idx++, fiduciaryId);
+            pstmt.setTimestamp(idx++, new Timestamp(start.getTime()));
+            pstmt.setTimestamp(idx++, new Timestamp(end.getTime()));
 
             rs = pstmt.executeQuery();
             pw = new PrintWriter(new FileWriter(outFile));

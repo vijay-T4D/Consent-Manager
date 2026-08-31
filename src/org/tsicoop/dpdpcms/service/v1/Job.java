@@ -51,9 +51,14 @@ public class Job implements Action {
 
             switch (func) {
                 case "create_job":
-                    // Manual CES (compliance scan) runs stay DPO/ADMIN-only; EXPORT jobs (reports)
-                    // remain available to Operators for their view/download access.
-                    if ("CES".equalsIgnoreCase((String) input.get("job_type")) && InputProcessor.rejectIfOperator(req, res)) return;
+                    // Manual CES (compliance scan) runs stay DPO/ADMIN-only. EXPORT jobs also
+                    // restricted to DPO/ADMIN as of 2026-08-13: JobManager.executeExportJob emits
+                    // plaintext PII (it's the DPO's authorised bulk-export path — decrypt, not
+                    // mask) as CSV, which is otherwise a silent bypass of the masking feature for
+                    // every other read path. Operators keep list_jobs/download_file for exports
+                    // someone else already ran, just can't trigger a fresh unmasked export.
+                    String jobType = (String) input.get("job_type");
+                    if (("CES".equalsIgnoreCase(jobType) || "EXPORT".equalsIgnoreCase(jobType)) && InputProcessor.rejectIfOperator(req, res)) return;
                     handleCreateJob(fiduciaryId, input, res);
                     break;
                 case "list_jobs":

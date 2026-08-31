@@ -12,7 +12,9 @@ import java.net.NetworkInterface;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.sql.*;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -308,10 +310,29 @@ public class Legal implements Action {
 
         UUID adminFid = UUID.fromString("00000000-0000-0000-0000-000000000000");
 
+        // Union the live audit_logs with any detached-but-never-deleted archived partitions
+        // (see JobManager.checkAndArchiveAuditPartitions / Audit.getArchivedTableNames) so an
+        // evidence certificate for an older case still finds every event, not just the last
+        // ~2 years of retention.
+        List<String> auditTables = new ArrayList<>();
+        auditTables.add("audit_logs");
+        auditTables.addAll(Audit.getArchivedTableNames(conn));
+        StringBuilder fromClause = new StringBuilder();
+        if (auditTables.size() == 1) {
+            fromClause.append("audit_logs");
+        } else {
+            fromClause.append("(");
+            for (int i = 0; i < auditTables.size(); i++) {
+                if (i > 0) fromClause.append(" UNION ALL ");
+                fromClause.append("SELECT * FROM ").append(auditTables.get(i));
+            }
+            fromClause.append(") audit_logs_all");
+        }
+
         // Broad search: match user_id or context_details.
         // Also check both the specific Fiduciary ID AND the System Admin ID (for background jobs).
-        String sql = "SELECT timestamp, audit_action, current_log_hash, prev_log_hash FROM audit_logs " +
-                     "WHERE (user_id ILIKE ? OR user_id = ? OR context_details ILIKE ?) " +
+        String sql = "SELECT timestamp, audit_action, current_log_hash, prev_log_hash FROM " + fromClause +
+                     " WHERE (user_id ILIKE ? OR user_id = ? OR context_details ILIKE ?) " +
                      "AND (fiduciary_id = ? OR fiduciary_id = ?) " +
                      "ORDER BY timestamp ASC";
         try {

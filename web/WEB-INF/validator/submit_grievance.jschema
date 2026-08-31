@@ -27,6 +27,9 @@
     },
     "language": {
       "type": "string"
+    },
+    "channel": {
+      "type": "string"
     }
   },
   "required": [

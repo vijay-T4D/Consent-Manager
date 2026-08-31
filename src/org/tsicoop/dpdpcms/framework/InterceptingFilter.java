@@ -123,13 +123,26 @@ public class InterceptingFilter implements Filter {
         String uri = req.getRequestURI();
         String servletPath = req.getServletPath(); // e.g., /api/v1/user, /api/v1/policy
 
-        // CORS — origin driven by environment; defaults to deny-all if unset
-        String allowedOrigin = System.getenv("ALLOWED_ORIGINS");
-        if (allowedOrigin != null && !allowedOrigin.trim().isEmpty()) {
-            res.setHeader("Access-Control-Allow-Origin", allowedOrigin.trim());
+        // CORS — origin driven by environment; defaults to deny-all if unset.
+        // ALLOWED_ORIGINS may hold a comma-separated allowlist; the response header must echo
+        // back a single matching origin (a raw multi-value list is not a valid CORS header and
+        // browsers reject it outright, breaking every origin at once instead of just the mismatched one).
+        String requestOrigin = req.getHeader("Origin");
+        String allowedOrigins = System.getenv("ALLOWED_ORIGINS");
+        if (allowedOrigins != null && !allowedOrigins.trim().isEmpty()) {
+            if (requestOrigin != null) {
+                for (String allowed : allowedOrigins.split(",")) {
+                    if (allowed.trim().equalsIgnoreCase(requestOrigin)) {
+                        res.setHeader("Access-Control-Allow-Origin", requestOrigin);
+                        break;
+                    }
+                }
+            } else {
+                res.setHeader("Access-Control-Allow-Origin", allowedOrigins.split(",")[0].trim());
+            }
         }
         res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-API-KEY");
+        res.setHeader("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-API-Key, X-API-Secret");
         res.setHeader("Access-Control-Max-Age", "3600");
 
         // Security headers

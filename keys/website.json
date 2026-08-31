@@ -1,0 +1,88 @@
+{
+  "en": {
+    "title": "Educate Girls - Data & Privacy Policy",
+    "introduction": "Educate Girls is committed to protecting the privacy of our donors, volunteers, and website visitors. This policy explains how we collect, use, and safeguard your personal data in compliance with the Digital Personal Data Protection Act (DPDP), 2023, while we work to advance girls' education across India.",
+    "general_purpose_description": "We process personal data to process donations, manage volunteer registrations, send program updates, and improve our website experience.",
+    "data_processing_purposes": [
+      {
+        "id": "purpose_donation_processing",
+        "name": "Donation Processing",
+        "description": "To process one-time and recurring donations, issue tax receipts (80G), and maintain donor records as required by law.",
+        "legal_basis": "Consent",
+        "data_categories_involved": ["full_name", "email_address", "mobile_number", "postal_address", "pan_card", "donation_amount", "payment_reference"],
+        "recipients_or_third_parties": ["Razorpay"],
+        "retention_policy": "Retained for 8 years post-transaction to comply with Income Tax Act record-keeping requirements for 80G receipts.",
+        "retention_duration_value": 8,
+        "retention_duration_unit": "YEARS",
+        "retention_start_event": "COLLECTION",
+        "is_mandatory_for_service": true,
+        "is_sensitive": false
+      },
+      {
+        "id": "purpose_volunteer_registration",
+        "name": "Volunteer Registration & Management",
+        "description": "To register, verify, and coordinate volunteers supporting field and outreach programs.",
+        "legal_basis": "Consent",
+        "data_categories_involved": ["full_name", "email_address", "mobile_number", "postal_address", "volunteer_skills"],
+        "recipients_or_third_parties": [],
+        "retention_policy": "Retained for 3 years after last active engagement, then deleted unless re-consented.",
+        "retention_duration_value": 3,
+        "retention_duration_unit": "YEARS",
+        "retention_start_event": "CESSATION",
+        "is_mandatory_for_service": true,
+        "is_sensitive": false
+      },
+      {
+        "id": "purpose_newsletter_updates",
+        "name": "Newsletter & Program Updates",
+        "description": "To send email/SMS updates about programs, impact stories, and fundraising campaigns.",
+        "legal_basis": "Consent",
+        "data_categories_involved": ["full_name", "email_address", "mobile_number"],
+        "recipients_or_third_parties": ["Mailchimp"],
+        "retention_policy": "Retained until consent is withdrawn (unsubscribe), with a 2-year inactivity backstop.",
+        "retention_duration_value": 2,
+        "retention_duration_unit": "YEARS",
+        "retention_start_event": "COLLECTION",
+        "is_mandatory_for_service": false,
+        "is_sensitive": false
+      },
+      {
+        "id": "purpose_website_analytics",
+        "name": "Website Analytics & Improvement",
+        "description": "To understand website usage patterns and improve navigation and content for visitors.",
+        "legal_basis": "Legitimate Use",
+        "data_categories_involved": ["ip_address", "device_id"],
+        "recipients_or_third_parties": ["Google Analytics"],
+        "retention_policy": "Anonymized/aggregated after 14 months per analytics provider defaults.",
+        "retention_duration_value": 14,
+        "retention_duration_unit": "MONTHS",
+        "retention_start_event": "COLLECTION",
+        "is_mandatory_for_service": false,
+        "is_sensitive": false
+      }
+    ],
+    "data_categories_details": [
+      { "id": "full_name", "name": "Full Name", "description": "Legal name of donor, volunteer, or visitor." },
+      { "id": "email_address", "name": "Email Address", "description": "Primary contact email." },
+      { "id": "mobile_number", "name": "Mobile Number", "description": "Primary contact phone number." },
+      { "id": "postal_address", "name": "Postal Address", "description": "Mailing address for receipts and correspondence." },
+      { "id": "pan_card", "name": "PAN Card", "description": "Required for donations eligible for 80G tax exemption above statutory thresholds." },
+      { "id": "donation_amount", "name": "Donation Amount", "description": "Value of the contribution made." },
+      { "id": "payment_reference", "name": "Payment Reference", "description": "Transaction/payment gateway reference ID." },
+      { "id": "volunteer_skills", "name": "Volunteer Skills", "description": "Self-declared skills and availability for volunteering." },
+      { "id": "ip_address", "name": "IP Address", "description": "Network address captured for analytics and security." },
+      { "id": "device_id", "name": "Device Identifier", "description": "Anonymized device/browser identifier used for analytics." }
+    ],
+    "data_subject_categories": ["donor", "volunteer", "website_visitor"],
+    "security_measures": "TLS 1.3 in transit, AES-256 encryption at rest, role-based access control, periodic access audits.",
+    "processors": [
+      { "name": "Razorpay", "country": "IN", "role": "Payment Gateway", "contact": "compliance@razorpay.com" },
+      { "name": "Mailchimp", "country": "US", "role": "Email/SMS Campaign Delivery", "contact": "privacy@mailchimp.com" },
+      { "name": "Google Analytics", "country": "US", "role": "Website Analytics", "contact": "privacy@google.com" }
+    ],
+    "cross_border_transfers": [
+      { "destination_country": "US", "safeguard": "Standard Contractual Clauses (SCC)", "processor": "Mailchimp" },
+      { "destination_country": "US", "safeguard": "Standard Contractual Clauses (SCC)", "processor": "Google Analytics" }
+    ]
+  }
+}

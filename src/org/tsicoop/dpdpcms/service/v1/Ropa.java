@@ -504,10 +504,10 @@ public class Ropa implements Action {
                 "COUNT(*) FILTER (WHERE c.consent_granted = FALSE) AS inactive_consent_count " +
                 "FROM ropa_entries r " +
                 "LEFT JOIN LATERAL (" +
-                "  SELECT DISTINCT ON (cr.user_id) cr.user_id, (dp->>'consent_granted')::boolean AS consent_granted " +
+                "  SELECT DISTINCT ON (cr.user_id_hmac) cr.user_id_hmac, (dp->>'consent_granted')::boolean AS consent_granted " +
                 "  FROM consent_records cr, jsonb_array_elements(cr.data_point_consents) AS dp " +
                 "  WHERE cr.fiduciary_id = r.fiduciary_id AND dp->>'data_point_id' = r.source_purpose_id " +
-                "  ORDER BY cr.user_id, cr.created_at DESC" +
+                "  ORDER BY cr.user_id_hmac, cr.created_at DESC" +
                 ") c ON TRUE " +
                 "WHERE r.fiduciary_id = ?");
 
@@ -610,10 +610,10 @@ public class Ropa implements Action {
     private long getConsentCountForEntry(UUID entryId, boolean active) throws SQLException {
         String sql = "SELECT COUNT(*) FROM ropa_entries r " +
                 "JOIN LATERAL (" +
-                "  SELECT DISTINCT ON (cr.user_id) cr.user_id, (dp->>'consent_granted')::boolean AS consent_granted " +
+                "  SELECT DISTINCT ON (cr.user_id_hmac) cr.user_id_hmac, (dp->>'consent_granted')::boolean AS consent_granted " +
                 "  FROM consent_records cr, jsonb_array_elements(cr.data_point_consents) AS dp " +
                 "  WHERE cr.fiduciary_id = r.fiduciary_id AND dp->>'data_point_id' = r.source_purpose_id " +
-                "  ORDER BY cr.user_id, cr.created_at DESC" +
+                "  ORDER BY cr.user_id_hmac, cr.created_at DESC" +
                 ") latest ON TRUE " +
                 "WHERE r.id = ? AND latest.consent_granted = " + (active ? "TRUE" : "FALSE");
         PoolDB pool = new PoolDB();
@@ -640,10 +640,10 @@ public class Ropa implements Action {
                 "COUNT(*) FILTER (WHERE c.consent_granted = FALSE) AS inactive_consent_count " +
                 "FROM ropa_entries r " +
                 "LEFT JOIN LATERAL (" +
-                "  SELECT DISTINCT ON (cr.user_id) cr.user_id, (dp->>'consent_granted')::boolean AS consent_granted " +
+                "  SELECT DISTINCT ON (cr.user_id_hmac) cr.user_id_hmac, (dp->>'consent_granted')::boolean AS consent_granted " +
                 "  FROM consent_records cr, jsonb_array_elements(cr.data_point_consents) AS dp " +
                 "  WHERE cr.fiduciary_id = r.fiduciary_id AND dp->>'data_point_id' = r.source_purpose_id " +
-                "  ORDER BY cr.user_id, cr.created_at DESC" +
+                "  ORDER BY cr.user_id_hmac, cr.created_at DESC" +
                 ") c ON TRUE " +
                 "WHERE r.fiduciary_id = ? AND r.status = 'active' " +
                 "GROUP BY r.id " +
@@ -751,6 +751,7 @@ public class Ropa implements Action {
                 pstmt = conn.prepareStatement(activateSql);
                 pstmt.setString(1, policyId);
                 if (pstmt.executeUpdate() > 0) {
+                    Policy.evictPolicyCache(policyId); // Policy.java caches get_policy reads; without this they'd keep serving the pre-activation snapshot
                     new Audit().logEventAsync("DPO", fiduciaryId, Constants.SERVICE_TYPE_DPO_CONSOLE,
                             fiduciaryId, "POLICY_ACTIVATED_BY_DPO", "policy:" + policyId);
                 }

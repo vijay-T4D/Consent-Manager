@@ -206,6 +206,7 @@
 <main class="flex-1 p-4 lg:p-8 overflow-y-auto">
     <div class="flex justify-between items-center mb-6">
         <h1 class="text-2xl font-black text-slate-800 tracking-tight">Grievance Management</h1>
+        <button type="button" id="log-grievance-btn" class="primary-bg text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-opacity-90">+ Log Grievance</button>
     </div>
 
     <!-- Grievance List Card -->
@@ -232,6 +233,7 @@
                     <th class="px-4 py-3 text-sm">ID</th>
                     <th class="px-4 py-3 text-sm">Type</th>
                     <th class="px-4 py-3 text-sm">Subject</th>
+                    <th class="px-4 py-3 text-sm">Channel</th>
                     <th class="px-4 py-3 text-sm">Submitted</th>
                     <th class="px-4 py-3 text-sm">Status</th>
                     <th class="px-4 py-3 text-sm">Deadline</th>
@@ -242,7 +244,7 @@
                 <tbody id="grievance-table-body" class="bg-white divide-y divide-gray-200">
                 <!-- Data will be dynamically inserted here -->
                 <tr>
-                    <td colspan="8" class="p-4 text-center text-gray-500">
+                    <td colspan="9" class="p-4 text-center text-gray-500">
                         Loading Grievance data...
                     </td>
                 </tr>
@@ -264,8 +266,9 @@
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm mb-4">
             <div class="space-y-1">
                 <p><strong>Type:</strong> <span id="detail-type"></span></p>
-                <p><strong>Submitted By:</strong> <span id="detail-user-id"></span></p>
+                <p><strong>Submitted By:</strong> <span id="detail-user-id"></span> <button id="detail-user-reveal-btn" class="text-xs" title="Reveal — this action is logged">👁</button></p>
                 <p><strong>Submitted On:</strong> <span id="detail-date"></span></p>
+                <p><strong>Channel:</strong> <span id="detail-channel"></span></p>
             </div>
             <div class="space-y-1">
                 <p><strong>Current Status:</strong> <span id="detail-status" class="font-bold"></span></p>
@@ -317,12 +320,116 @@
     </div>
 </div>
 
+<!-- Modal for DPO-Logged Grievance (e.g. one that arrived by email or phone, not via the app) -->
+<div id="log-grievance-modal-overlay" class="modal-overlay">
+    <div class="modal-content" style="max-width: 600px;">
+        <h2 class="text-2xl font-semibold primary-text mb-2">Log a Grievance</h2>
+        <p class="text-sm text-gray-500 mb-4">For a grievance that reached you outside the principal's usual self-service flow — an email, a phone call, a letter — so it's tracked in the same queue and against the same SLA as one submitted through the app. This will be recorded against your operator account.</p>
+        <form id="log-grievance-form" class="space-y-3">
+            <div>
+                <label for="log-grievance-user-id" class="block text-sm font-medium text-gray-700">Data Principal Identifier (email or mobile)</label>
+                <input type="text" id="log-grievance-user-id" name="user_id" required class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm" placeholder="e.g. name@example.com">
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+                <div>
+                    <label for="log-grievance-channel" class="block text-sm font-medium text-gray-700">How it was received</label>
+                    <select id="log-grievance-channel" name="channel" required class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                        <option value="EMAIL">Email</option>
+                        <option value="PHONE">Phone</option>
+                        <option value="LETTER">Letter</option>
+                        <option value="IN_PERSON">In Person</option>
+                        <option value="OTHER">Other</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="log-grievance-type" class="block text-sm font-medium text-gray-700">Type</label>
+                    <select id="log-grievance-type" name="type" required class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm">
+                        <option value="CONSENT_DISPUTE">Consent Dispute</option>
+                        <option value="DATA_ACCURACY">Data Accuracy</option>
+                        <option value="ERASURE_REQUEST">Erasure Request</option>
+                        <option value="UNAUTHORIZED_PROCESSING">Unauthorized Processing</option>
+                        <option value="OTHER">Other</option>
+                    </select>
+                </div>
+            </div>
+            <div>
+                <label for="log-grievance-subject" class="block text-sm font-medium text-gray-700">Subject</label>
+                <input type="text" id="log-grievance-subject" name="subject" required maxlength="255" class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm" placeholder="Short summary">
+            </div>
+            <div>
+                <label for="log-grievance-description" class="block text-sm font-medium text-gray-700">Description</label>
+                <textarea id="log-grievance-description" name="description" rows="4" required class="mt-1 block w-full p-2 border border-gray-300 rounded-md shadow-sm" placeholder="What the principal told you, in as much detail as they gave..."></textarea>
+            </div>
+            <p id="log-grievance-error" class="text-sm text-red-600 hidden"></p>
+            <div class="modal-footer">
+                <button type="button" id="log-grievance-cancel-btn" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-md text-sm font-medium hover:bg-gray-300">Cancel</button>
+                <button type="submit" id="log-grievance-submit-btn" class="primary-bg text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-opacity-90">Log Grievance</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     // --- Configuration ---
     const API_URL_GRIEVANCE = '/api/v1/grievance'; // Endpoint for Grievance CRUD
     const API_URL_FIDUCIARIES_LIST = '/api/v1/admin/fiduciary';
     const API_URL_OPERATOR = '/api/v1/admin/operator';
+    const API_URL_PII = '/api/v1/pii';
     const AUTH_TOKEN = localStorage.getItem('authToken');
+    let revealConfirmedThisSession = false;
+
+    // --- PII reveal helper (same shape as principals.html) ---
+    async function revealPii(button, source, idOrRef, useRef) {
+        if (!revealConfirmedThisSession) {
+            if (!confirm("This reveal will be recorded in the audit log against your account. Continue?")) return;
+            revealConfirmedThisSession = true;
+        }
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = '…';
+        try {
+            const payload = { "_func": "reveal_user_id", "source": source, "fiduciary_id": localStorage.getItem("fiduciary_id") };
+            if (useRef) payload.user_ref = idOrRef; else payload.id = idOrRef;
+
+            const response = await fetch(API_URL_PII, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (!response.ok) {
+                alert("Reveal failed: " + (result.message || response.status));
+                button.textContent = original;
+                button.disabled = false;
+                return;
+            }
+            const span = button.previousElementSibling;
+            const maskedText = span.textContent;
+            span.textContent = result.user_id;
+            button.textContent = '🙈';
+            setTimeout(() => {
+                span.textContent = maskedText;
+                button.textContent = original;
+                button.disabled = false;
+            }, 30000);
+        } catch (e) {
+            alert("Reveal failed.");
+            button.textContent = original;
+            button.disabled = false;
+        }
+    }
     const IS_OPERATOR = localStorage.getItem('role') === 'OPERATOR';
     if (IS_OPERATOR) {
         document.querySelectorAll('a[href="policies.html"], a[href="settings.html"], a[href="team.html"]').forEach(el => el.remove());
@@ -407,7 +514,8 @@
             <td class="px-4 py-3 text-sm text-gray-600">...${grievance.grievance_id.slice(-8)}</td>
             <td class="px-4 py-3 text-sm font-medium text-gray-900">${grievance.type.replace(/_/g, ' ')}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${grievance.subject || 'N/A'}</td>
-            <td class="px-4 py-3 text-sm text-gray-600">${new Date(grievance.submission_timestamp).toLocaleDateString()}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${(grievance.channel || 'PORTAL').replace(/_/g, ' ')}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${formatDate(grievance.submission_timestamp)}</td>
             <td class="px-4 py-3 whitespace-nowrap text-sm">${createStatusBadge(status)}</td>
             <td class="px-4 py-3 text-sm font-semibold">${calculateDeadlineDisplay(grievance.due_date,status)}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${OperatorMap[grievance.assigned_dpo_user_id] || 'Unassigned'}</td>
@@ -452,7 +560,7 @@
 
 
     async function loadGrievances(searchTerm = "") {
-        tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center text-gray-500">Loading Grievance data...</td></tr>`;
+        tableBody.innerHTML = `<tr><td colspan="9" class="p-4 text-center text-gray-500">Loading Grievance data...</td></tr>`;
         errorMessageP.classList.add('hidden');
 
         try {
@@ -492,7 +600,7 @@
                 tableBody.innerHTML = '';
 
                 if (grievances.length === 0) {
-                    tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center text-gray-500">No grievances found matching criteria.</td></tr>`;
+                    tableBody.innerHTML = `<tr><td colspan="9" class="p-4 text-center text-gray-500">No grievances found matching criteria.</td></tr>`;
                 } else {
                     grievances.forEach(g => {
                         tableBody.appendChild(createGrievanceRow(g));
@@ -505,7 +613,7 @@
 
         } catch (error) {
             console.error("Error loading Grievances:", error);
-            tableBody.innerHTML = `<tr><td colspan="8" class="p-4 text-center text-red-600">
+            tableBody.innerHTML = `<tr><td colspan="9" class="p-4 text-center text-red-600">
                 Error connecting to the Grievance API.
             </td></tr>`;
             errorMessageP.classList.remove('hidden');
@@ -551,9 +659,11 @@
         // Populate modal details
         document.getElementById('modal-grievance-id').textContent = grievance.id;
         document.getElementById('detail-user-id').textContent = grievance.user_id;
-        document.getElementById('detail-date').textContent = new Date(grievance.submission_timestamp).toLocaleString();
+        document.getElementById('detail-user-reveal-btn').onclick = (e) => revealPii(e.target, 'grievance', grievance.grievance_id, false);
+        document.getElementById('detail-date').textContent = formatDateTime(grievance.submission_timestamp);
+        document.getElementById('detail-channel').textContent = (grievance.channel || 'PORTAL').replace(/_/g, ' ');
         document.getElementById('detail-status').innerHTML = createStatusBadge(grievance.status);
-        document.getElementById('detail-deadline').textContent = new Date(grievance.due_date).toLocaleDateString();
+        document.getElementById('detail-deadline').textContent = formatDate(grievance.due_date);
         document.getElementById('detail-description').textContent = grievance.description;
 
         // Resolution Form Setup
@@ -612,7 +722,15 @@
     }
 
     // --- Fetch Operators, Fiduciaries and Load Grievances ---
-    fetchOperators().then(loadGrievances);
+    // Deep-link support: a link from the Dashboard's "Pending DPO Action" table
+    // (grievances.html?id=<uuid>) opens straight into that grievance's detail modal
+    // instead of just landing on the unfiltered list.
+    const deepLinkGrievanceId = new URLSearchParams(window.location.search).get('id');
+    fetchOperators().then(loadGrievances).then(() => {
+        if (deepLinkGrievanceId) {
+            viewGrievance(deepLinkGrievanceId);
+        }
+    });
 
     // --- Event Listener Attachments ---
     menuToggle.addEventListener('click', toggleMenu);
@@ -631,6 +749,64 @@
 
     // Modal Close
     document.getElementById('close-modal-btn-inner').addEventListener('click', closeModal);
+
+    // --- DPO-Logged Grievance (Log Grievance) ---
+    const logGrievanceModalOverlay = document.getElementById('log-grievance-modal-overlay');
+    const logGrievanceForm = document.getElementById('log-grievance-form');
+    const logGrievanceError = document.getElementById('log-grievance-error');
+
+    document.getElementById('log-grievance-btn').addEventListener('click', function() {
+        logGrievanceForm.reset();
+        logGrievanceError.classList.add('hidden');
+        logGrievanceModalOverlay.style.display = 'flex';
+    });
+
+    document.getElementById('log-grievance-cancel-btn').addEventListener('click', function() {
+        logGrievanceModalOverlay.style.display = 'none';
+    });
+
+    logGrievanceForm.addEventListener('submit', async function(event) {
+        event.preventDefault();
+        logGrievanceError.classList.add('hidden');
+
+        const payload = {
+            "_func": "submit_grievance",
+            "user_id": document.getElementById('log-grievance-user-id').value.trim(),
+            "fiduciary_id": localStorage.getItem('fiduciary_id'),
+            "channel": document.getElementById('log-grievance-channel').value,
+            "type": document.getElementById('log-grievance-type').value,
+            "subject": document.getElementById('log-grievance-subject').value.trim(),
+            "description": document.getElementById('log-grievance-description').value.trim()
+        };
+
+        const submitBtn = document.getElementById('log-grievance-submit-btn');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Logging...';
+
+        try {
+            const response = await fetch(API_URL_GRIEVANCE, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify(payload)
+            });
+            const responseData = await response.json();
+
+            if (response.ok) {
+                logGrievanceModalOverlay.style.display = 'none';
+                alert(`Grievance logged (ID: ${responseData.grievance_id}).`);
+                loadGrievances(searchInput.value.trim());
+            } else {
+                logGrievanceError.textContent = responseData.message || `Failed to log grievance (status ${response.status}).`;
+                logGrievanceError.classList.remove('hidden');
+            }
+        } catch (error) {
+            logGrievanceError.textContent = "Network error: could not reach the API.";
+            logGrievanceError.classList.remove('hidden');
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Log Grievance';
+        }
+    });
 
     // Handle Operator Assignment (DPO/ADMIN only)
     if (!IS_OPERATOR) {

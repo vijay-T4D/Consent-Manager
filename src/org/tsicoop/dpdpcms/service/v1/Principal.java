@@ -130,7 +130,9 @@ public class Principal implements Action {
         String token = JWTUtil.generatePrincipalToken(userId, fiduciaryIdStr);
 
         // Audit the login
-        new Audit().logEventAsync(userId, fiduciaryId, "PRINCIPAL_PORTAL", null, "PRINCIPAL_LOGIN", "Portal login for " + userId);
+        // Masked, not raw — context_details is free text with no encryption of its own; the
+        // hashed subject already goes into audit_logs.user_id via the first arg here.
+        new Audit().logEventAsync(userId, fiduciaryId, "PRINCIPAL_PORTAL", null, "PRINCIPAL_LOGIN", "Portal login for " + PiiMasking.mask(userId));
 
         JSONObject response = new JSONObject();
         response.put("success", true);

@@ -5,6 +5,8 @@ import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
 import org.tsicoop.dpdpcms.framework.PoolDB;
 import org.tsicoop.dpdpcms.framework.WebhookDispatcher;
+import org.tsicoop.dpdpcms.framework.DbEncryption;
+import org.tsicoop.dpdpcms.framework.PiiMasking;
 import org.tsicoop.dpdpcms.service.v1.App;
 import org.tsicoop.dpdpcms.service.v1.Audit;
 import org.tsicoop.dpdpcms.util.Constants;
@@ -35,10 +37,13 @@ public class CESService {
         List<JSONObject> principals = new ArrayList<JSONObject>();
         String sql = null;
         boolean targetFiltered = target != null && !target.equalsIgnoreCase("FULL");
+        // Internal batch processing only — never returned to a console/API response, so the real
+        // (decrypted) user_id is used directly here, matching how it's fed straight into
+        // processPrincipal()'s own consent_records/notification lookups below.
         if (targetFiltered) {
-            sql = "SELECT fiduciary_id,user_id,last_consent_mechanism,last_ces_run FROM data_principal WHERE fiduciary_id=? AND user_id=? LIMIT ? OFFSET ?";
+            sql = "SELECT fiduciary_id," + DbEncryption.decryptCol("user_id_enc") + " AS user_id,last_consent_mechanism,last_ces_run FROM data_principal WHERE fiduciary_id=? AND user_id_hmac=" + DbEncryption.HMAC + " LIMIT ? OFFSET ?";
         } else {
-            sql = "SELECT fiduciary_id,user_id,last_consent_mechanism,last_ces_run FROM data_principal WHERE fiduciary_id=? ORDER BY user_id LIMIT ? OFFSET ?";
+            sql = "SELECT fiduciary_id," + DbEncryption.decryptCol("user_id_enc") + " AS user_id,last_consent_mechanism,last_ces_run FROM data_principal WHERE fiduciary_id=? ORDER BY user_id_hmac LIMIT ? OFFSET ?";
         }
         PreparedStatement stmt = null;
         ResultSet rs = null;
@@ -50,14 +55,15 @@ public class CESService {
             pool = new PoolDB();
             conn = pool.getConnection();
             stmt = conn.prepareStatement(sql);
-            stmt.setObject(1, fiduciaryId);
+            int idx = DbEncryption.bindKey(stmt, 1); // decryptCol key
+            stmt.setObject(idx++, fiduciaryId);
             if (targetFiltered) {
-                stmt.setString(2, target);
-                stmt.setInt(3, limit);
-                stmt.setInt(4, offset);
+                idx = DbEncryption.bindHmac(stmt, idx, target);
+                stmt.setInt(idx++, limit);
+                stmt.setInt(idx++, offset);
             } else {
-                stmt.setInt(2, limit);
-                stmt.setInt(3, offset);
+                stmt.setInt(idx++, limit);
+                stmt.setInt(idx++, offset);
             }
             rs = stmt.executeQuery();
             while (rs.next()) {
@@ -137,13 +143,13 @@ public class CESService {
         PoolDB pool = null;
         Connection conn = null;
 
-        String checkSql = "SELECT id, consent_mechanism, data_point_consents, created_at FROM consent_records WHERE user_id = ? AND fiduciary_id = ? ORDER BY created_at DESC LIMIT 1";
+        String checkSql = "SELECT id, consent_mechanism, data_point_consents, created_at FROM consent_records WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? ORDER BY created_at DESC LIMIT 1";
         try{
             pool = new PoolDB();
             conn = pool.getConnection();
             stmt = conn.prepareStatement(checkSql);
-            stmt.setString(1, principalId);
-            stmt.setObject(2, UUID.fromString(fiduciaryId));
+            int idx = DbEncryption.bindHmac(stmt, 1, principalId);
+            stmt.setObject(idx, UUID.fromString(fiduciaryId));
             rs = stmt.executeQuery();
             if (rs.next()) {
                 String recordId = rs.getString("id");
@@ -218,7 +224,9 @@ public class CESService {
                                     Constants.NOTIF_PURGE_INIT);
                 // log audit event
                 JSONObject auditContext = new JSONObject();
-                auditContext.put("principal", principalId);
+                // Masked, not raw — context_details is free text with no encryption of its own;
+                // the hashed subject already goes into audit_logs.user_id via the first arg below.
+                auditContext.put("principal", PiiMasking.mask(principalId));
                 auditContext.put("trigger", Constants.PURGE_TRIGGER_ERASURE);
                 auditContext.put("app", new App().getAppName(UUID.fromString(appid), UUID.fromString(fiduciaryId)));
                 auditContext.put("purpose",purposeId);
@@ -231,7 +239,7 @@ public class CESService {
     private List<JSONObject> getAppIdsByPurpose(String userId, String fiduciaryId, String purposeId) throws SQLException {
         //System.out.println("userId:"+userId+" fiduciaryId:"+fiduciaryId+" purposeId:"+purposeId);
         List<JSONObject> appIds = new ArrayList<JSONObject>();
-        String sql = "SELECT DISTINCT app_id FROM consent_validations WHERE user_id = ? AND fiduciary_id = ? AND purpose_id = ? AND app_id IS NOT NULL";
+        String sql = "SELECT DISTINCT app_id FROM consent_validations WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? AND purpose_id = ? AND app_id IS NOT NULL";
 
         PreparedStatement stmt = null;
         ResultSet rs = null;
@@ -243,9 +251,9 @@ public class CESService {
             pool = new PoolDB();
             conn = pool.getConnection();
             stmt = conn.prepareStatement(sql);
-            stmt.setString(1, userId);
-            stmt.setObject(2, UUID.fromString(fiduciaryId));
-            stmt.setString(3, purposeId);
+            int idx = DbEncryption.bindHmac(stmt, 1, userId);
+            stmt.setObject(idx++, UUID.fromString(fiduciaryId));
+            stmt.setString(idx++, purposeId);
 
             rs = stmt.executeQuery();
             while (rs.next()) {
@@ -393,7 +401,7 @@ public class CESService {
                         // log audit event
                         // log audit event
                         JSONObject auditContext = new JSONObject();
-                        auditContext.put("principal", principalId);
+                        auditContext.put("principal", PiiMasking.mask(principalId));
                         auditContext.put("trigger", Constants.PURGE_TRIGGER_EXPIRY);
                         auditContext.put("app", new App().getAppName(UUID.fromString(appid), UUID.fromString(fiduciaryId)));
                         auditContext.put("purpose",purposeId);
@@ -416,8 +424,8 @@ public class CESService {
                                          String triggerEvent,
                                          String status) throws SQLException {
         JSONObject response = new JSONObject();
-        String sql = "INSERT INTO purge_requests (user_id, fiduciary_id, purpose_id, app_id, trigger_event, status) " +
-                "VALUES (?, ?, ?, ?, ?, ?) RETURNING id";
+        String sql = "INSERT INTO purge_requests (user_id_enc, user_id_hmac, fiduciary_id, purpose_id, app_id, trigger_event, status) " +
+                "VALUES (" + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, ?, ?) RETURNING id";
 
         PreparedStatement stmt = null;
         ResultSet rs = null;
@@ -431,12 +439,13 @@ public class CESService {
 
             stmt = conn.prepareStatement(sql);
 
-            stmt.setString(1, userId);
-            stmt.setObject(2, UUID.fromString(fiduciaryId));
-            stmt.setString(3, purposeId);
-            stmt.setObject(4, UUID.fromString(appId));
-            stmt.setString(5, triggerEvent);
-            stmt.setString(6, status);
+            int idx = DbEncryption.bindEncrypt(stmt, 1, userId);
+            idx = DbEncryption.bindHmac(stmt, idx, userId);
+            stmt.setObject(idx++, UUID.fromString(fiduciaryId));
+            stmt.setString(idx++, purposeId);
+            stmt.setObject(idx++, UUID.fromString(appId));
+            stmt.setString(idx++, triggerEvent);
+            stmt.setString(idx++, status);
 
             rs = stmt.executeQuery();
             if (rs.next()) {
@@ -465,6 +474,9 @@ public class CESService {
         }
 
         if (Boolean.TRUE.equals(response.get("success"))) {
+            // Deliberate: this webhook goes to the fiduciary's own endpoint, which already owns
+            // this identity (it's the same user_id their own app originally submitted). Same
+            // reasoning as the equivalent payload in Compliance.updatePurgeStatus.
             JSONObject payload = new JSONObject();
             payload.put("id", response.get("id"));
             payload.put("user_id", userId);
@@ -491,8 +503,8 @@ public class CESService {
                                               String purposeId,
                                               String triggerEvent,
                                               String details) throws SQLException {
-        String sql = "INSERT INTO purge_requests (user_id, fiduciary_id, purpose_id, app_id, trigger_event, status, details) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id";
+        String sql = "INSERT INTO purge_requests (user_id_enc, user_id_hmac, fiduciary_id, purpose_id, app_id, trigger_event, status, details) " +
+                "VALUES (" + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, ?, ?, ?) RETURNING id";
 
         PreparedStatement stmt = null;
         ResultSet rs = null;
@@ -505,13 +517,14 @@ public class CESService {
 
             stmt = conn.prepareStatement(sql);
 
-            stmt.setString(1, principalId);
-            stmt.setObject(2, UUID.fromString(fiduciaryId));
-            stmt.setString(3, purposeId);
-            stmt.setNull(4, Types.OTHER);
-            stmt.setString(5, triggerEvent);
-            stmt.setString(6, Constants.EVENT_PURGE_INITIATED);
-            stmt.setString(7, details);
+            int idx = DbEncryption.bindEncrypt(stmt, 1, principalId);
+            idx = DbEncryption.bindHmac(stmt, idx, principalId);
+            stmt.setObject(idx++, UUID.fromString(fiduciaryId));
+            stmt.setString(idx++, purposeId);
+            stmt.setNull(idx++, Types.OTHER);
+            stmt.setString(idx++, triggerEvent);
+            stmt.setString(idx++, Constants.EVENT_PURGE_INITIATED);
+            stmt.setString(idx++, details);
 
             rs = stmt.executeQuery();
             if (rs.next()) {
@@ -532,7 +545,7 @@ public class CESService {
         }
 
         JSONObject auditContext = new JSONObject();
-        auditContext.put("principal", principalId);
+        auditContext.put("principal", PiiMasking.mask(principalId));
         auditContext.put("trigger", triggerEvent);
         auditContext.put("app", "No Linked Processor");
         auditContext.put("purpose", purposeId);
@@ -549,8 +562,8 @@ public class CESService {
                                          String fiduciaryId,
                                          String notificationType) throws SQLException {
         JSONObject response = new JSONObject();
-        String sql = "INSERT INTO notifications (recipient_type, recipient_id, fiduciary_id, notification_type) " +
-                "VALUES (?, ?, ?, ?) RETURNING id, created_at";
+        String sql = "INSERT INTO notifications (recipient_type, recipient_id_enc, recipient_id_hmac, fiduciary_id, notification_type) " +
+                "VALUES (?, " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?) RETURNING id, created_at";
 
         PreparedStatement stmt = null;
         ResultSet rs = null;
@@ -564,9 +577,10 @@ public class CESService {
             conn = pool.getConnection();
             stmt = conn.prepareStatement(sql);
             stmt.setString(1, recipientType);
-            stmt.setString(2, recipientId);
-            stmt.setObject(3, UUID.fromString(fiduciaryId));
-            stmt.setString(4, notificationType);
+            int idx = DbEncryption.bindEncrypt(stmt, 2, recipientId);
+            idx = DbEncryption.bindHmac(stmt, idx, recipientId);
+            stmt.setObject(idx++, UUID.fromString(fiduciaryId));
+            stmt.setString(idx++, notificationType);
 
             rs = stmt.executeQuery();
             if (rs.next()) {
@@ -580,6 +594,8 @@ public class CESService {
         }
 
         if (newId != null) {
+            // Deliberate: webhook to the fiduciary's own endpoint, same "they already own this
+            // identity" reasoning as the purge-request webhook payloads elsewhere in this file.
             JSONObject payload = new JSONObject();
             payload.put("id", newId);
             payload.put("recipient_type", recipientType);
@@ -628,7 +644,7 @@ public class CESService {
      */
     public JSONObject updatePrincipalComplianceMetadata(String fiduciaryId, String userId, String mechanism, Timestamp lastCESRun) throws SQLException {
         JSONObject response = new JSONObject();
-        String sql = "UPDATE data_principal SET last_consent_mechanism = ?, last_ces_run=?::timestamp WHERE user_id = ? and fiduciary_id=?";
+        String sql = "UPDATE data_principal SET last_consent_mechanism = ?, last_ces_run=?::timestamp WHERE user_id_hmac = " + DbEncryption.HMAC + " and fiduciary_id=?";
 
         PreparedStatement stmt = null;
         PoolDB pool = null;
@@ -640,8 +656,8 @@ public class CESService {
             stmt = conn.prepareStatement(sql);
             stmt.setString(1, mechanism);
             stmt.setTimestamp(2, lastCESRun);
-            stmt.setString(3, userId);
-            stmt.setObject(4,UUID.fromString(fiduciaryId));
+            int idx = DbEncryption.bindHmac(stmt, 3, userId);
+            stmt.setObject(idx,UUID.fromString(fiduciaryId));
             int rowsAffected = stmt.executeUpdate();
             if (rowsAffected > 0) {
                 response.put("success", true);

@@ -256,22 +256,47 @@ public class Audit implements Action {
 
     // --- List and Detail Methods (Unchanged Logic, added hash retrieval) ---
 
+    /**
+     * Names of audit_logs partitions that have been detached and archived (see
+     * JobManager.checkAndArchiveAuditPartitions, 16_audit_archive_registry.sql). Archived data is
+     * never deleted — it's a standalone table with the exact same columns as the live audit_logs,
+     * just outside the live partitioned parent. Callers UNION these back in so a search or an
+     * evidence-certificate trail (Legal.fetchValidatedTrail) can still span the retention boundary.
+     */
+    public static List<String> getArchivedTableNames(Connection conn) throws SQLException {
+        List<String> names = new ArrayList<>();
+        try (PreparedStatement pstmt = conn.prepareStatement(
+                "SELECT partition_name FROM audit_log_archive_registry ORDER BY period_start");
+             ResultSet rs = pstmt.executeQuery()) {
+            while (rs.next()) names.add(rs.getString("partition_name"));
+        } catch (SQLException e) {
+            // Registry table not present yet (e.g. pre-16_audit_archive_registry.sql deploy) —
+            // fail open to "no archives exist" rather than breaking every audit read.
+        }
+        return names;
+    }
+
+    /** A UNION ALL of the live audit_logs table plus every archived partition, so every read path
+     *  below transparently searches the full history regardless of the 2-year retention cutoff. */
+    // Package-visible (not private) — Consent.getConsentAuditEntryFromDb reuses this to
+    // cross-reference a live consent_records row against its tamper-evident audit_logs entry,
+    // regardless of whether that entry has since aged into an archived partition.
+    static String auditLogsUnionSource(Connection conn) throws SQLException {
+        List<String> tables = new ArrayList<>();
+        tables.add("audit_logs");
+        tables.addAll(getArchivedTableNames(conn));
+        if (tables.size() == 1) return "audit_logs"; // common case, no archives yet — skip the UNION
+        StringBuilder sb = new StringBuilder("(");
+        for (int i = 0; i < tables.size(); i++) {
+            if (i > 0) sb.append(" UNION ALL ");
+            sb.append("SELECT * FROM ").append(tables.get(i));
+        }
+        sb.append(") audit_logs_all");
+        return sb.toString();
+    }
+
     protected JSONArray listAuditLogsFromDb(String search, UUID fiduciaryId, String action, int page, int limit) throws SQLException {
         JSONArray logs = new JSONArray();
-        StringBuilder sql = new StringBuilder("SELECT * FROM audit_logs WHERE fiduciary_id = ?");
-        List<Object> params = new ArrayList<>();
-        params.add(fiduciaryId);
-
-        if (action != null && !action.isEmpty()) { sql.append(" AND audit_action = ?"); params.add(action); }
-        if (search != null && !search.isEmpty()) {
-            sql.append(" AND (user_id ILIKE ? OR context_details ILIKE ?)");
-            params.add("%" + search + "%"); params.add("%" + search + "%");
-        }
-
-        sql.append(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
-        params.add(limit);
-        params.add((page - 1) * limit);
-
         PoolDB pool = new PoolDB();
         Connection conn = null;
         PreparedStatement pstmt = null;
@@ -279,6 +304,33 @@ public class Audit implements Action {
 
         try {
             conn = pool.getConnection();
+            StringBuilder sql = new StringBuilder("SELECT * FROM " + auditLogsUnionSource(conn) + " WHERE fiduciary_id = ?");
+            List<Object> params = new ArrayList<>();
+            params.add(fiduciaryId);
+
+            if (action != null && !action.isEmpty()) { sql.append(" AND audit_action = ?"); params.add(action); }
+            if (search != null && !search.isEmpty()) {
+                // Bug fix (2026-08-13): user_id here has always been a one-way SHA-256 hash
+                // (LookupHasher, see the INSERT in logEvents() below) — `user_id ILIKE '%term%'` can
+                // never match a base64 hash, so this half of the OR has been silently dead since
+                // LookupHasher was introduced. Fixed the same way Legal.fetchValidatedTrail already
+                // handles this: hash the search term server-side and match it exactly.
+                String hashedSearch = null;
+                try {
+                    hashedSearch = new LookupHasher().hashData(search);
+                } catch (Exception ignored) {
+                    // TSI_LOOKUP_SALT not set — fall back to a search term that can never match,
+                    // same fail-safe-closed behavior as the dead ILIKE it replaces.
+                }
+                sql.append(" AND (user_id = ? OR context_details ILIKE ?)");
+                params.add(hashedSearch != null ? hashedSearch : "");
+                params.add("%" + search + "%");
+            }
+
+            sql.append(" ORDER BY timestamp DESC LIMIT ? OFFSET ?");
+            params.add(limit);
+            params.add((page - 1) * limit);
+
             pstmt = conn.prepareStatement(sql.toString());
             for (int i = 0; i < params.size(); i++) pstmt.setObject(i + 1, params.get(i));
 
@@ -318,7 +370,7 @@ public class Audit implements Action {
 
         try {
             conn = pool.getConnection();
-            pstmt = conn.prepareStatement("SELECT * FROM audit_logs WHERE id = ?");
+            pstmt = conn.prepareStatement("SELECT * FROM " + auditLogsUnionSource(conn) + " WHERE id = ?");
             pstmt.setObject(1, id);
             rs = pstmt.executeQuery();
             if (rs.next()) {

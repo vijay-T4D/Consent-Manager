@@ -206,7 +206,7 @@
         <h2 class="text-lg font-bold text-slate-700 mb-4 tracking-tight">Search & Filter</h2>
         <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-3">
             <div class="flex gap-3">
-                <input type="text" id="search-input" placeholder="Search by User ID..." class="p-2 border border-gray-300 rounded-md text-sm w-full max-w-xs">
+                <input type="text" id="search-input" placeholder="Search by exact Principal ID or details keyword..." class="p-2 border border-gray-300 rounded-md text-sm w-full max-w-xs">
                 <select id="status-filter" class="p-2 border border-gray-300 rounded-md text-sm">
                     <option value="ALL">Status: ALL</option>
                     <option value="PURGE_INITIATED">INITIATED</option>
@@ -253,7 +253,7 @@
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm mb-4">
             <div class="space-y-1">
-                <p><strong>Principal:</strong> <span id="detail-user-id"></span></p>
+                <p><strong>Principal:</strong> <span id="detail-user-id"></span> <button id="detail-user-reveal-btn" class="text-xs" title="Reveal — this action is logged">👁</button></p>
                 <p><strong>Target App:</strong> <span id="modal-app-name"></span></p>
                 <p><strong>Purpose:</strong> <span id="detail-purpose-id"></span></p>
             </div>
@@ -369,12 +369,67 @@
 </div>
 
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     // --- Configuration ---
     const API_URL_PURGE = '/api/v1/admin/compliance';
     const API_URL_JOBS = '/api/v1/admin/job';
     const API_URL_OPERATOR = '/api/v1/admin/operator';
+    const API_URL_PII = '/api/v1/pii';
     const AUTH_TOKEN = localStorage.getItem('authToken');
     const FIDUCIARY_ID = localStorage.getItem('fiduciary_id');
+    let revealConfirmedThisSession = false;
+
+    // --- PII reveal helper (same shape as principals.html/grievances.html) ---
+    async function revealPii(button, source, idOrRef, useRef) {
+        if (!revealConfirmedThisSession) {
+            if (!confirm("This reveal will be recorded in the audit log against your account. Continue?")) return;
+            revealConfirmedThisSession = true;
+        }
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = '…';
+        try {
+            const payload = { "_func": "reveal_user_id", "source": source, "fiduciary_id": localStorage.getItem("fiduciary_id") };
+            if (useRef) payload.user_ref = idOrRef; else payload.id = idOrRef;
+
+            const response = await fetch(API_URL_PII, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (!response.ok) {
+                alert("Reveal failed: " + (result.message || response.status));
+                button.textContent = original;
+                button.disabled = false;
+                return;
+            }
+            const span = button.previousElementSibling;
+            const maskedText = span.textContent;
+            span.textContent = result.user_id;
+            button.textContent = '🙈';
+            setTimeout(() => {
+                span.textContent = maskedText;
+                button.textContent = original;
+                button.disabled = false;
+            }, 30000);
+        } catch (e) {
+            alert("Reveal failed.");
+            button.textContent = original;
+            button.disabled = false;
+        }
+    }
     const IS_OPERATOR = localStorage.getItem('role') === 'OPERATOR';
     if (IS_OPERATOR) {
         document.querySelectorAll('a[href="policies.html"], a[href="settings.html"], a[href="team.html"]').forEach(el => el.remove());
@@ -436,17 +491,18 @@
         const row = document.createElement('tr');
         row.innerHTML = `
             <td class="px-2 py-2 font-mono text-gray-600 truncate" title="${req.id}">...${req.id.slice(-8)}</td>
-            <td class="px-2 py-2 text-gray-800 truncate" title="${req.user_id}">${req.user_id}</td>
+            <td class="px-2 py-2 text-gray-800 truncate"><span>${req.user_id}</span> <button class="reveal-btn text-xs" title="Reveal — this action is logged" data-id="${req.id}">👁</button></td>
             <td class="px-2 py-2 text-gray-800 truncate" title="${req.purpose_id}">${req.purpose_id}</td>
             <td class="px-2 py-2 text-gray-600 truncate" title="${req.trigger_event}">${req.trigger_event}</td>
             <td class="px-2 py-2 text-gray-600 truncate" title="${req.app_name}">${req.app_name}</td>
-            <td class="px-2 py-2 text-gray-600 truncate">${new Date(req.initiated_at).toLocaleDateString()}</td>
+            <td class="px-2 py-2 text-gray-600 truncate">${formatDate(req.initiated_at)}</td>
             <td class="px-2 py-2 truncate">${createStatusBadge(req.status)}</td>
             <td class="px-2 py-2 text-gray-600 truncate">${OperatorMap[req.assigned_operator_id] || 'Unassigned'}</td>
             <td class="px-2 py-2">
                 <button class="text-indigo-600 hover:text-indigo-900 font-medium" onclick="viewPurgeRequest('${req.id}')">Manage</button>
             </td>
         `;
+        row.querySelector('.reveal-btn').addEventListener('click', (e) => revealPii(e.target, 'purge_request', req.id, false));
         return row;
     }
 
@@ -499,10 +555,11 @@
 
             document.getElementById('modal-app-name').textContent = req.app_name;
             document.getElementById('detail-user-id').textContent = req.user_id;
+            document.getElementById('detail-user-reveal-btn').onclick = (e) => revealPii(e.target, 'purge_request', id, false);
             document.getElementById('detail-purpose-id').textContent = req.purpose_id;
             document.getElementById('detail-trigger').textContent = req.trigger_event;
             document.getElementById('detail-status').innerHTML = createStatusBadge(req.status);
-            document.getElementById('detail-initiated').textContent = new Date(req.initiated_at).toLocaleString();
+            document.getElementById('detail-initiated').textContent = formatDateTime(req.initiated_at);
             document.getElementById('detail-context').textContent = req.details || "No additional context provided.";
             // Prefill form
             document.getElementById('new-status').value = req.status === 'PENDING' ? 'IN_PROGRESS' : req.status;
@@ -564,7 +621,7 @@
                             <td class="p-3 font-mono text-[11px] text-slate-500">...${job.id.slice(-8)}</td>
                             <td class="p-3 font-bold text-xs text-slate-700">${job.job_type}</td>
                             <td class="p-3 text-xs text-slate-600">${job.subtype || 'FULL_RUN'}</td>
-                            <td class="p-3 text-xs text-slate-500">${new Date(job.created_at).toLocaleString()}</td>
+                            <td class="p-3 text-xs text-slate-500">${formatDateTime(job.created_at)}</td>
                             <td class="p-3"><span class="px-2 py-0.5 rounded-full text-[10px] font-bold ${statusColor}">${job.status}</span></td>
                         </tr>
                      `;

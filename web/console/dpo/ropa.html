@@ -267,6 +267,18 @@
 
 
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     const API = '/api/v1/admin/ropa';
     const AUTH_TOKEN = localStorage.getItem('authToken');
     const FIDUCIARY_ID = localStorage.getItem('fiduciary_id');
@@ -436,7 +448,7 @@
                     <div class="history-row">
                         <div class="flex justify-between items-center">
                             <span class="text-xs font-bold text-slate-600">Version ${h.version}</span>
-                            <span class="text-[10px] text-slate-400">${new Date(h.changed_at).toLocaleString()}</span>
+                            <span class="text-[10px] text-slate-400">${formatDateTime(h.changed_at)}</span>
                         </div>
                         ${h.changed_by ? `<div class="text-[10px] text-slate-400 font-mono mt-0.5">by ${h.changed_by.slice(0,8)}…</div>` : ''}
                     </div>

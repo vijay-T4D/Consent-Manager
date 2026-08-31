@@ -153,6 +153,18 @@
 </main>
 
 <script>
+        // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+        function formatDate(d) {
+            const dt = new Date(d);
+            const pad = n => String(n).padStart(2, '0');
+            return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+        }
+        function formatDateTime(d) {
+            const dt = new Date(d);
+            const pad = n => String(n).padStart(2, '0');
+            return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+        }
+
         function esc(s) {
             if (s == null) return '';
             return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#x27;');
@@ -206,7 +218,7 @@
                     <tr class="hover:bg-slate-50/50 transition-colors">
                         <td class="py-4 px-2 font-mono text-[11px] text-slate-500">...${esc(job.id.slice(-12))}</td>
                         <td class="py-4 px-2 font-bold text-slate-700">${esc(job.subtype)}</td>
-                        <td class="py-4 px-2 text-slate-500">${esc(new Date(job.created_at).toLocaleString())}</td>
+                        <td class="py-4 px-2 text-slate-500">${esc(formatDateTime(job.created_at))}</td>
                         <td class="py-4 px-2">
                             <span class="status-pill ${statusColor}">${esc(job.status)}</span>
                         </td>

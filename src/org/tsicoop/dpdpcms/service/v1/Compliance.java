@@ -248,18 +248,19 @@ public class Compliance implements Action {
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
 
-        String sql = "INSERT INTO purge_requests (id, user_id, fiduciary_id, processor_id, trigger_event, data_categories_to_purge, processing_purposes_affected, status, initiated_at) VALUES (uuid_generate_v4(), ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, NOW()) RETURNING id";
+        String sql = "INSERT INTO purge_requests (id, user_id_enc, user_id_hmac, fiduciary_id, processor_id, trigger_event, data_categories_to_purge, processing_purposes_affected, status, initiated_at) VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, ?::jsonb, ?::jsonb, ?, NOW()) RETURNING id";
 
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-            pstmt.setString(1, userId);
-            pstmt.setObject(2, fiduciaryId);
-            pstmt.setObject(3, processorId);
-            pstmt.setString(4, triggerEvent);
-            pstmt.setString(5, dataCategoriesToPurge != null ? dataCategoriesToPurge.toJSONString() : "[]");
-            pstmt.setString(6, processingPurposesAffected != null ? processingPurposesAffected.toJSONString() : "[]");
-            pstmt.setString(7, status);
+            int idx = DbEncryption.bindEncrypt(pstmt, 1, userId);
+            idx = DbEncryption.bindHmac(pstmt, idx, userId);
+            pstmt.setObject(idx++, fiduciaryId);
+            pstmt.setObject(idx++, processorId);
+            pstmt.setString(idx++, triggerEvent);
+            pstmt.setString(idx++, dataCategoriesToPurge != null ? dataCategoriesToPurge.toJSONString() : "[]");
+            pstmt.setString(idx++, processingPurposesAffected != null ? processingPurposesAffected.toJSONString() : "[]");
+            pstmt.setString(idx++, status);
 
             int affectedRows = pstmt.executeUpdate();
             if (affectedRows == 0) {
@@ -300,7 +301,7 @@ public class Compliance implements Action {
         String serviceType = null;
 
         String sql = "UPDATE purge_requests SET status = ?, details = ?, last_updated_at = NOW() WHERE id = ?";
-        String sql2 = "select user_id, fiduciary_id, assigned_operator_id from purge_requests WHERE id = ?";
+        String sql2 = "select " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, fiduciary_id, assigned_operator_id from purge_requests WHERE id = ?";
 
         try {
             conn = pool.getConnection();
@@ -331,7 +332,8 @@ public class Compliance implements Action {
 
             // Audit Log: Log the purge confirmation event
             pstmt = conn.prepareStatement(sql2);
-            pstmt.setObject(1, purgeRequestId);
+            int idx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setObject(idx, purgeRequestId);
             rs = pstmt.executeQuery();
             if(rs.next()) {
                 userId = rs.getString("user_id");
@@ -366,6 +368,11 @@ public class Compliance implements Action {
                 e.printStackTrace(); // Notification failure must not fail the purge status update
             }
 
+            // Deliberate decision (2026-08-13, not an artifact of the table still being plaintext
+            // elsewhere): the outbound webhook goes to the fiduciary's own endpoint, and the
+            // fiduciary already owns this identity — it's the same user_id their own app supplied
+            // when the purge was triggered. Shipping the plaintext here is correct; it must never
+            // be copied into a context that isn't already trusted by that fiduciary.
             JSONObject webhookPayload = new JSONObject();
             webhookPayload.put("id", purgeRequestId.toString());
             webhookPayload.put("status", confirmationStatus);
@@ -409,8 +416,12 @@ public class Compliance implements Action {
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
 
-        StringBuilder sqlBuilder = new StringBuilder("SELECT pr.id, pr.user_id, pr.purpose_id, pr.fiduciary_id, pr.app_id, pr.trigger_event, pr.status, pr.initiated_at, pr.details, pr.assigned_operator_id, a.name FROM purge_requests pr LEFT JOIN apps a ON pr.app_id = a.id WHERE pr.fiduciary_id = ?");
+        StringBuilder sqlBuilder = new StringBuilder("SELECT pr.id, " + DbEncryption.decryptCol("pr.user_id_enc") + " AS user_id, pr.user_id_hmac, pr.purpose_id, pr.fiduciary_id, pr.app_id, pr.trigger_event, pr.status, pr.initiated_at, pr.details, pr.assigned_operator_id, a.name FROM purge_requests pr LEFT JOIN apps a ON pr.app_id = a.id WHERE pr.fiduciary_id = ?");
         List<Object> params = new ArrayList<>();
+        // decryptCol's key bind slot is the first '?' to appear in the SQL text (in the SELECT
+        // clause), so it must be bound first — see the loop below that binds `params` starting
+        // at position 2.
+        params.add(DbEncryption.key());
         params.add(fiduciaryId);
 
         // Operators only see their own assigned queue; DPO/ADMIN see the full fiduciary list.
@@ -436,8 +447,14 @@ public class Compliance implements Action {
             params.add(triggerFilter);
         }
         if (search != null && !search.isEmpty()) {
-            sqlBuilder.append(" AND (pr.user_id ILIKE ? OR pr.details ILIKE ?)");
-            params.add("%" + search + "%");
+            // Regression, unavoidable: substring search on the identifier is no longer possible
+            // once it's encrypted — pgcrypto ciphertext isn't searchable, and partial-matching an
+            // HMAC would require decrypting every row. This is now an EXACT match on the identifier
+            // (still case/whitespace-insensitive, matching DbEncryption.HMAC's lower(trim(...))),
+            // OR'd with the existing substring search over the free-text `details` column.
+            sqlBuilder.append(" AND (pr.user_id_hmac = " + DbEncryption.HMAC + " OR pr.details ILIKE ?)");
+            params.add(search);
+            params.add(DbEncryption.key());
             params.add("%" + search + "%");
         }
 
@@ -456,7 +473,9 @@ public class Compliance implements Action {
             while (rs.next()) {
                 JSONObject request = new JSONObject();
                 request.put("id", rs.getString("id"));
-                request.put("user_id", rs.getString("user_id"));
+                // Mask by default — the DPO/operator list view didn't supply this identifier.
+                request.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                request.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 request.put("purpose_id", rs.getString("purpose_id"));
                 request.put("fiduciary_id", rs.getString("fiduciary_id"));
                 request.put("app_id", rs.getString("app_id"));
@@ -487,18 +506,21 @@ public class Compliance implements Action {
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
 
-        String sql = "SELECT pr.id, pr.user_id, pr.fiduciary_id, pr.purpose_id, pr.app_id, pr.trigger_event, pr.status, pr.initiated_at, pr.details, pr.assigned_operator_id, a.name FROM purge_requests pr LEFT JOIN apps a ON pr.app_id = a.id WHERE pr.id=?";
+        String sql = "SELECT pr.id, " + DbEncryption.decryptCol("pr.user_id_enc") + " AS user_id, pr.user_id_hmac, pr.fiduciary_id, pr.purpose_id, pr.app_id, pr.trigger_event, pr.status, pr.initiated_at, pr.details, pr.assigned_operator_id, a.name FROM purge_requests pr LEFT JOIN apps a ON pr.app_id = a.id WHERE pr.id=?";
 
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, UUID.fromString(id));
+            int idx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setObject(idx, UUID.fromString(id));
             rs = pstmt.executeQuery();
 
             if (rs.next()) {
                 purgeob = new JSONObject();
                 purgeob.put("id", rs.getString("id"));
-                purgeob.put("user_id", rs.getString("user_id"));
+                // Mask by default — the operator viewing this record didn't supply the identifier.
+                purgeob.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                purgeob.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 purgeob.put("fiduciary_id", rs.getString("fiduciary_id"));
                 purgeob.put("purpose_id", rs.getString("purpose_id"));
                 purgeob.put("app_id", rs.getString("app_id"));

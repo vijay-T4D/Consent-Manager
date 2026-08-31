@@ -9,6 +9,9 @@
     "user_id": {
       "type": "string"
     },
+    "user_ref": {
+      "type": "string"
+    },
     "fiduciary_id": {
       "type": "string"
     },
@@ -20,7 +23,10 @@
     }
   },
   "required": [
-    "_func",
-    "user_id"
+    "_func"
+  ],
+  "anyOf": [
+    { "required": ["user_id"] },
+    { "required": ["user_ref"] }
   ]
 }

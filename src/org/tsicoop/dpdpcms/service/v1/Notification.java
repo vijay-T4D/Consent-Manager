@@ -241,17 +241,24 @@ public class Notification implements Action {
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
 
-        StringBuilder sqlBuilder = new StringBuilder("SELECT n.id, n.recipient_type, n.recipient_id, n.fiduciary_id, n.notification_type, n.created_at, n.read_at, t.messages " +
+        // decryptCol's key bind slot is the first '?' to appear in the SQL text (in the SELECT
+        // clause) — must be the first entry in `params` since every '?' below is bound in the
+        // exact order it's appended to this list.
+        StringBuilder sqlBuilder = new StringBuilder("SELECT n.id, n.recipient_type, " + DbEncryption.decryptCol("n.recipient_id_enc") + " AS recipient_id, n.fiduciary_id, n.notification_type, n.created_at, n.read_at, t.messages " +
                 "FROM notifications n LEFT JOIN notification_message_templates t ON t.fiduciary_id = n.fiduciary_id AND t.notification_type = n.notification_type WHERE 1=1");
         List<Object> params = new ArrayList<>();
+        params.add(DbEncryption.key());
 
         if (recipientType != null && !recipientType.isEmpty()) {
             sqlBuilder.append(" AND n.recipient_type = ?");
             params.add(recipientType);
         }
         if (recipientId != null && !recipientId.isEmpty()) {
-            sqlBuilder.append(" AND n.recipient_id = ?");
+            // Self-service (a principal listing their own notifications, or an App polling by its
+            // own app_id) — no masking on the response below, the caller already knows this value.
+            sqlBuilder.append(" AND n.recipient_id_hmac = " + DbEncryption.HMAC);
             params.add(recipientId);
+            params.add(DbEncryption.key());
         }
         if (fiduciaryId != null) {
             sqlBuilder.append(" AND n.fiduciary_id = ?");

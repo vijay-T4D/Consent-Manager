@@ -34,6 +34,12 @@ public class Policy implements Action {
     // Thread-safe in-memory cache for Policy lookups to minimize database round-trips
     private static final Map<String, JSONObject> policyCache = new ConcurrentHashMap<>();
 
+    // Lets other services (e.g. Ropa's RoPA-approval activation) invalidate a cached
+    // lookup after they mutate consent_policies.status directly, bypassing this class.
+    public static void evictPolicyCache(String policyId) {
+        policyCache.remove(policyId);
+    }
+
     /**
      * Handles all Policy Management operations via a single POST endpoint.
      * The specific operation is determined by the '_func' attribute in the JSON request body.
@@ -682,6 +688,7 @@ public class Policy implements Action {
 
         // Instrument audit log only after connection is returned to pool
         if (success) {
+            policyCache.remove(policyId); // Evict stale cache entry (e.g. a prior archived/deleted policy reusing this ID)
             new Audit().logEventAsync("DPO", fiduciaryId, Constants.SERVICE_TYPE_DPO_CONSOLE, fiduciaryId, "POLICY_CREATED", "ID: " + policyId);
         }
         return new JSONObject() {{ put("success", true); put("data", output); }};
@@ -720,6 +727,7 @@ public class Policy implements Action {
 
         // Instrument audit log only after connection is returned to pool
         if (success) {
+            policyCache.remove(policyId); // Evict stale cache entry so subsequent get_policy reads see the new content
             new Audit().logEventAsync("DPO", (fiduciaryId != null ? fiduciaryId : ADMIN_FID_UUID), Constants.SERVICE_TYPE_DPO_CONSOLE, (fiduciaryId != null ? fiduciaryId : ADMIN_FID_UUID), "POLICY_UPDATED", "ID: " + policyId);
         }
         return new JSONObject() {{ put("success", true); put("message", "Policy updated successfully."); }};
@@ -790,6 +798,7 @@ public class Policy implements Action {
         }
 
         if (success) {
+            policyCache.remove(policyId); // Evict stale (pre-publish) cache entry so get_policy reflects the new status
             new Audit().logEventAsync("DPO", fiduciaryId, Constants.SERVICE_TYPE_DPO_CONSOLE, fiduciaryId, "POLICY_PUBLISHED", "ID: " + policyId);
             try {
                 RopaDeriver.deriveFromPolicy(policyId, version, fiduciaryId);
@@ -855,6 +864,7 @@ public class Policy implements Action {
         }
 
         if (success) {
+            policyCache.remove(policyId); // Evict stale cache entry so get_policy reflects the ARCHIVED status
             new Audit().logEventAsync("DPO", fiduciaryId, Constants.SERVICE_TYPE_DPO_CONSOLE, fiduciaryId, "POLICY_DELETED", "ID: " + policyId);
             new Audit().logEventAsync("DPO", fiduciaryId, Constants.SERVICE_TYPE_DPO_CONSOLE, fiduciaryId, "ROPA_AUTO_RETIRED", "Policy archived: " + policyId);
         }

@@ -298,6 +298,18 @@
 </div>
 
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     const API_URL_BREACH = '/api/v1/admin/breach';
     const API_URL_POLICY = '/api/v1/admin/policy';
     const API_URL_NOTIFICATION = '/api/v1/admin/notification';
@@ -361,7 +373,7 @@
             <td class="px-4 py-3 text-sm font-medium text-gray-800">${b.title}</td>
             <td class="px-4 py-3 text-sm">${createSeverityBadge(b.severity)}</td>
             <td class="px-4 py-3 text-sm text-gray-600">${b.affected_principal_count}</td>
-            <td class="px-4 py-3 text-sm text-gray-600">${new Date(b.reported_at).toLocaleDateString()}</td>
+            <td class="px-4 py-3 text-sm text-gray-600">${formatDate(b.reported_at)}</td>
             <td class="px-4 py-3 whitespace-nowrap text-sm">${createStatusBadge(b.status)}</td>
             <td class="px-4 py-3 text-sm">
                 <button class="text-indigo-600 hover:text-indigo-900 font-medium" onclick="viewBreach('${b.id}')">Manage</button>${downloadButton}
@@ -463,8 +475,8 @@
             document.getElementById('detail-affected-count').textContent = b.affected_principal_count;
             document.getElementById('detail-notification-type').textContent = b.notification_type || 'BREACH_NOTIFICATION (generic)';
             document.getElementById('detail-status').innerHTML = createStatusBadge(b.status);
-            document.getElementById('detail-detected').textContent = new Date(b.detected_at).toLocaleString();
-            document.getElementById('detail-reported').textContent = new Date(b.reported_at).toLocaleString();
+            document.getElementById('detail-detected').textContent = formatDateTime(b.detected_at);
+            document.getElementById('detail-reported').textContent = formatDateTime(b.reported_at);
             document.getElementById('detail-description').textContent = b.description;
             document.getElementById('detail-actionable-steps').textContent = b.actionable_steps;
             document.getElementById('new-status').value = b.status;

@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "get_consent_audit_trail",
+  "type": "object",
+  "required": ["_func", "record_id", "fiduciary_id"],
+  "properties": {
+    "_func": {
+      "type": "string"
+    },
+    "record_id": {
+      "type": "string"
+    },
+    "fiduciary_id": {
+      "type": "string"
+    }
+  }
+}

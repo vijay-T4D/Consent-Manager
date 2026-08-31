@@ -483,6 +483,18 @@
 </div>
 
 <script>
+    // dd/mm/yyyy formatting for record dates — consistent with the rest of the console.
+    function formatDate(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${pad(dt.getDate())}/${pad(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+    }
+    function formatDateTime(d) {
+        const dt = new Date(d);
+        const pad = n => String(n).padStart(2, '0');
+        return `${formatDate(dt)} ${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
     // --- Configuration ---
     const API_URL_POLICY = '/api/v1/policy';
     const AUTH_TOKEN = localStorage.getItem('authToken');
@@ -575,7 +587,7 @@
                 ${createStatusBadge(policy.status)}
                 ${isUnderReview ? '<div class="text-[10px] text-blue-500 mt-0.5">Pending DPO ROPA approval</div>' : ''}
             </td>
-            <td class="px-4 py-4 whitespace-nowrap text-xs text-slate-400 font-medium">${new Date(policy.effective_date).toLocaleDateString()}</td>
+            <td class="px-4 py-4 whitespace-nowrap text-xs text-slate-400 font-medium">${formatDate(policy.effective_date)}</td>
             <td class="px-4 py-4 whitespace-nowrap">${actionsHtml}</td>
         `;
         return row;
@@ -712,6 +724,7 @@
             const payload = {
                 "_func": isEditing ? "update_policy" : "create_policy",
                 "policy_id": isEditing ? policyIdHidden.value : policyIdInput.value.trim(),
+                "fiduciary_id": localStorage.getItem('fiduciary_id'),
                 "policy_content": json,
                 "jurisdiction": policyJurisdictionSelect.value
             };

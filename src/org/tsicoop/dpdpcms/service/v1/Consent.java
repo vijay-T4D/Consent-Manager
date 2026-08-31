@@ -86,6 +86,7 @@ public class Consent implements Action {
 
             // Extract common parameters for consent record operations
             String userId = (String) input.get("user_id"); // Data Principal's ID
+            String userRef = (String) input.get("user_ref"); // opaque truncated-hmac handle, alternative to user_id for read lookups (see listPrincipalsFromDb)
             UUID fiduciaryId = null;
             String fiduciaryIdStr = input.get("fiduciary_id") != null ? (String) input.get("fiduciary_id") : null;
             // When called via PRINCIPAL JWT, fiduciary_id is stamped on request attributes by InterceptingFilter
@@ -116,6 +117,18 @@ public class Consent implements Action {
                 }
             }
 
+            // Console drill-down support: listPrincipalsFromDb/listConsentHistoryFromDb return a
+            // masked user_id plus an opaque "user_ref" (truncated user_id_hmac) so the console never
+            // has to hold the plaintext to page through a principal's history. Resolve it back to the
+            // real identifier here, scoped to fiduciary_id, before any read handler below runs.
+            if ((userId == null || userId.trim().isEmpty()) && userRef != null && !userRef.trim().isEmpty() && fiduciaryId != null) {
+                userId = resolveUserIdFromRef(userRef, fiduciaryId);
+                if (userId == null) {
+                    OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No principal found for the given 'user_ref'.", req.getRequestURI());
+                    return;
+                }
+            }
+
             switch (func.toLowerCase()) {
                 case "record_consent": // Used for initial grant, update, or withdrawal
                     String policyId = (String) input.get("policy_id");
@@ -124,7 +137,7 @@ public class Consent implements Action {
                     String jurisdiction = "IN";
                     String languageSelected = input.get("language_selected")!=null?(String) input.get("language_selected"):"en";
                     String consentStatusGeneral = "CONSENT_GIVEN";
-                    String consentMechanism = "CONSENT_GIVEN";
+                    String consentMechanism = input.get("consent_mechanism") != null ? (String) input.get("consent_mechanism") : "CONSENT_GIVEN";
                     String ipAddressStr = (String) req.getRemoteAddr();
                     String userAgent = (String) input.get("user_agent");
                     JSONArray dataPointConsents = (JSONArray) input.get("data_point_consents");
@@ -173,7 +186,10 @@ public class Consent implements Action {
                         output = activeConsentOptional.get();
                         OutputProcessor.send(res, HttpServletResponse.SC_OK, output);
                     } else {
-                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No active consent found for User ID '" + userId + "' and Fiduciary ID '" + fiduciaryId + "'.", req.getRequestURI());
+                        // Mask — this error text is user-facing (surfaces in console alerts/logs) and
+                        // userId may have just been resolved from an opaque user_ref the caller
+                        // supplied, in which case they never had the plaintext to begin with.
+                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No active consent found for User ID '" + PiiMasking.mask(userId) + "' and Fiduciary ID '" + fiduciaryId + "'.", req.getRequestURI());
                     }
                     break;
                 case "get_consent_record_details":
@@ -183,7 +199,28 @@ public class Consent implements Action {
                         output = consentOptional.get();
                         OutputProcessor.send(res, HttpServletResponse.SC_OK, output);
                     } else {
-                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No active consent found for User ID '" + userId + "' and Fiduciary ID '" + fiduciaryId + "'.", req.getRequestURI());
+                        // Mask — this error text is user-facing (surfaces in console alerts/logs) and
+                        // userId may have just been resolved from an opaque user_ref the caller
+                        // supplied, in which case they never had the plaintext to begin with.
+                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No active consent found for User ID '" + PiiMasking.mask(userId) + "' and Fiduciary ID '" + fiduciaryId + "'.", req.getRequestURI());
+                    }
+                    break;
+
+                case "get_consent_audit_trail":
+                    // Cross-references a live consent_records row against its own tamper-evident
+                    // audit_logs entry (matched via the consent_record_id embedded in that entry's
+                    // context_details, see recordConsentToDb) — proof, independent of the live
+                    // table, of what was actually logged as consented at the time.
+                    String auditRecordId = (String) input.get("record_id");
+                    if (auditRecordId == null || fiduciaryId == null) {
+                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_BAD_REQUEST, "Bad Request", "'record_id' and 'fiduciary_id' are required for 'get_consent_audit_trail'.", req.getRequestURI());
+                        return;
+                    }
+                    Optional<JSONObject> auditEntryOptional = getConsentAuditEntryFromDb(UUID.fromString(auditRecordId), fiduciaryId);
+                    if (auditEntryOptional.isPresent()) {
+                        OutputProcessor.send(res, HttpServletResponse.SC_OK, auditEntryOptional.get());
+                    } else {
+                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No matching audit_logs entry found for this consent record (may predate the consent_record_id being embedded in audit context, see 2026-08-13 fix).", req.getRequestURI());
                     }
                     break;
 
@@ -294,6 +331,31 @@ public class Consent implements Action {
         }
     }
 
+    /**
+     * Resolves a truncated user_id_hmac ("user_ref", see listPrincipalsFromDb) back to the real
+     * user_id, scoped to fiduciary_id so a leaked ref from one fiduciary can never resolve a
+     * principal belonging to another.
+     */
+    private String resolveUserIdFromRef(String userRef, UUID fiduciaryId) {
+        String sql = "SELECT " + DbEncryption.decryptCol("user_id_enc") + " AS user_id FROM data_principal WHERE user_id_hmac LIKE ? AND fiduciary_id = ?";
+        PoolDB pool = null;
+        Connection conn = null; PreparedStatement pstmt = null; ResultSet rs = null;
+        try {
+            pool = new PoolDB();
+            conn = pool.getConnection();
+            pstmt = conn.prepareStatement(sql);
+            int idx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setString(idx++, userRef + "%");
+            pstmt.setObject(idx++, fiduciaryId);
+            rs = pstmt.executeQuery();
+            return rs.next() ? rs.getString("user_id") : null;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (pool != null) try { pool.cleanup(rs, pstmt, conn); } catch (Exception ignored) {}
+        }
+    }
+
     private void handleRecordParentalVerification(JSONObject input, UUID fiduciaryId, UUID appId, HttpServletResponse res) throws SQLException {
         String childId = (String) input.get("child_principal_id");
         String guardianId = (String) input.get("guardian_principal_id");
@@ -307,20 +369,27 @@ public class Consent implements Action {
         ResultSet rs = null;
         UUID logId = null;
 
-        String sql = "INSERT INTO parental_verification_logs (id, child_principal_id, guardian_principal_id, verification_mechanism, provider_name, verification_ref_id, proof_metadata, fiduciary_id) " +
-                "VALUES (uuid_generate_v4(), ?, ?, ?, ?, ?, ?::jsonb, ?) RETURNING id";
+        // verification_ref_id/proof_metadata are meant to be an opaque pointer (e.g. an S3 key for
+        // a scanned guardianship document) plus purely descriptive metadata — never the identity
+        // document's own contents. Nothing enforces that shape, so they're encrypted the same as
+        // child/guardian ids: a caller that puts a real government ID in here gets the same
+        // protection. No _hmac — neither field is ever looked up by exact match.
+        String sql = "INSERT INTO parental_verification_logs (id, child_principal_id_enc, child_principal_id_hmac, guardian_principal_id_enc, guardian_principal_id_hmac, verification_mechanism, provider_name, verification_ref_id_enc, proof_metadata_enc, fiduciary_id) " +
+                "VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, " + DbEncryption.ENCRYPT + ", " + DbEncryption.ENCRYPT + ", ?) RETURNING id";
 
         PoolDB pool = new PoolDB();
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setString(1, childId);
-            pstmt.setString(2, guardianId);
-            pstmt.setString(3, mechanism);
-            pstmt.setString(4, provider);
-            pstmt.setString(5, refId);
-            pstmt.setString(6, proofMetadata != null ? proofMetadata : "{}");
-            pstmt.setObject(7, fiduciaryId);
+            int idx = DbEncryption.bindEncrypt(pstmt, 1, childId);
+            idx = DbEncryption.bindHmac(pstmt, idx, childId);
+            idx = DbEncryption.bindEncrypt(pstmt, idx, guardianId);
+            idx = DbEncryption.bindHmac(pstmt, idx, guardianId);
+            pstmt.setString(idx++, mechanism);
+            pstmt.setString(idx++, provider);
+            idx = DbEncryption.bindEncrypt(pstmt, idx, refId);
+            idx = DbEncryption.bindEncrypt(pstmt, idx, proofMetadata != null ? proofMetadata : "{}");
+            pstmt.setObject(idx++, fiduciaryId);
             rs = pstmt.executeQuery();
             if (rs.next()) {
                 logId = (UUID) rs.getObject(1);
@@ -334,8 +403,10 @@ public class Consent implements Action {
         if (logId != null){
             JSONObject auditContext = new JSONObject();
             auditContext.put("action", Constants.ACTION_PARENTAL_CONSENT);
-            auditContext.put("principal", childId);
-            auditContext.put("guardian", guardianId);
+            // Masked, not raw — context_details is free text with no encryption of its own;
+            // the hashed subject already goes into audit_logs.user_id via the first arg below.
+            auditContext.put("principal", PiiMasking.mask(childId));
+            auditContext.put("guardian", PiiMasking.mask(guardianId));
             auditContext.put("proof_metadata", proofMetadata);
             new Audit().logEventAsync(childId, fiduciaryId, Constants.SERVICE_TYPE_APP, appId , Constants.ACTION_PARENTAL_CONSENT, auditContext.toJSONString());
 
@@ -373,12 +444,12 @@ public class Consent implements Action {
                 String capturedPolicyId = null;
                 String capturedPolicyVersion = null;
                 String sqlConsent = "SELECT data_point_consents, is_active_consent, created_at, policy_id, policy_version FROM consent_records " +
-                    "WHERE user_id = ? AND fiduciary_id = ? " +
+                    "WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? " +
                     "ORDER BY created_at DESC LIMIT 1";
 
                 try (PreparedStatement pstmt = conn.prepareStatement(sqlConsent)) {
-                    pstmt.setString(1, userId);
-                    pstmt.setObject(2, UUID.fromString(fiduciaryId)); // Cast string to UUID for DB
+                    int hmacIdx = DbEncryption.bindHmac(pstmt, 1, userId);
+                    pstmt.setObject(hmacIdx, UUID.fromString(fiduciaryId)); // Cast string to UUID for DB
 
                     try (ResultSet rs = pstmt.executeQuery()) {
                         if (!rs.next()) {
@@ -451,7 +522,7 @@ public class Consent implements Action {
 
         JSONObject auditContext = new JSONObject();
         auditContext.put("action", Constants.ACTION_CONSENT_VALIDATION);
-        auditContext.put("principal", userId);
+        auditContext.put("principal", PiiMasking.mask(userId));
         auditContext.put("purpose", requiredPurposeId);
         if (granted != null && granted) {
             auditContext.put("status", Constants.VALIDATION_SUCCESS);
@@ -469,36 +540,38 @@ public class Consent implements Action {
      * Resetting last_ces_run to NULL forces a fresh evaluation of the latest consent action.
      */
     private void upsertDataPrincipal(Connection conn, UUID fiduciaryId, String userId, String lastConsentMechanism) throws SQLException {
-        String sql = "INSERT INTO data_principal (user_id, fiduciary_id, last_consent_mechanism, last_ces_run) " +
-                "VALUES (?, ?, ?, NULL) " +
-                "ON CONFLICT (user_id, fiduciary_id) DO UPDATE SET " +
+        String sql = "INSERT INTO data_principal (user_id_enc, user_id_hmac, fiduciary_id, last_consent_mechanism, last_ces_run) " +
+                "VALUES (" + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, NULL) " +
+                "ON CONFLICT (user_id_hmac, fiduciary_id) DO UPDATE SET " +
                 "last_consent_mechanism = EXCLUDED.last_consent_mechanism, last_ces_run = NULL";
         try (PreparedStatement stmt = conn.prepareStatement(sql)) {
-            stmt.setString(1, userId);
-            stmt.setObject(2, fiduciaryId);
-            stmt.setString(3, lastConsentMechanism);
+            int idx = DbEncryption.bindEncrypt(stmt, 1, userId);
+            idx = DbEncryption.bindHmac(stmt, idx, userId);
+            stmt.setObject(idx++, fiduciaryId);
+            stmt.setString(idx++, lastConsentMechanism);
             stmt.executeUpdate();
         }
     }
 
     private void logConsentValidations(Connection conn, UUID fiduciaryId, UUID appId, String userId, String purpose_id, String status) throws SQLException{
         // Upsert Data Principal Record
-        String upsertDataPrincipalSql = "INSERT INTO consent_validations (fiduciary_id,app_id,user_id,purpose_id,status) VALUES (?,?,?,?,?)";
+        String upsertDataPrincipalSql = "INSERT INTO consent_validations (fiduciary_id,app_id,user_id_enc,user_id_hmac,purpose_id,status) VALUES (?,?," + DbEncryption.ENCRYPT + "," + DbEncryption.HMAC + ",?,?)";
         PreparedStatement stmt = conn.prepareStatement(upsertDataPrincipalSql);
         stmt.setObject(1, fiduciaryId);
         stmt.setObject(2, appId);
-        stmt.setString(3, userId);
-        stmt.setObject(4, purpose_id);
-        stmt.setObject(5, status);
+        int idx = DbEncryption.bindEncrypt(stmt, 3, userId);
+        idx = DbEncryption.bindHmac(stmt, idx, userId);
+        stmt.setObject(idx++, purpose_id);
+        stmt.setObject(idx++, status);
         stmt.executeUpdate();
     }
 
     private void flagCES(Connection conn, UUID fiduciaryId, String userId) throws SQLException{
         // Upsert Data Principal Record
-        String upsertDataPrincipalSql = "update data_principal set last_ces_run=null where fiduciary_id=? and user_id=?";
+        String upsertDataPrincipalSql = "update data_principal set last_ces_run=null where fiduciary_id=? and user_id_hmac=" + DbEncryption.HMAC;
         PreparedStatement stmt = conn.prepareStatement(upsertDataPrincipalSql);
         stmt.setObject(1, fiduciaryId);
-        stmt.setString(2, userId);
+        DbEncryption.bindHmac(stmt, 2, userId);
         stmt.executeUpdate();
     }
 
@@ -529,10 +602,10 @@ public class Consent implements Action {
         String sqlSelectActive;
         if (scopedPolicyId != null && !scopedPolicyId.isEmpty()) {
             sqlSelectActive = "SELECT id, policy_id, policy_version, data_point_consents FROM consent_records " +
-                    "WHERE user_id = ? AND fiduciary_id = ? AND policy_id = ? ORDER BY timestamp DESC LIMIT 1";
+                    "WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? AND policy_id = ? ORDER BY timestamp DESC LIMIT 1";
         } else {
             sqlSelectActive = "SELECT id, policy_id, policy_version, data_point_consents FROM consent_records " +
-                    "WHERE user_id = ? AND fiduciary_id = ? ORDER BY timestamp DESC LIMIT 1";
+                    "WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? ORDER BY timestamp DESC LIMIT 1";
         }
 
         UUID oldRecordId = null;
@@ -546,10 +619,10 @@ public class Consent implements Action {
 
             // A. Select current active record details
             pstmt = conn.prepareStatement(sqlSelectActive);
-            pstmt.setString(1, userId);
-            pstmt.setObject(2, fiduciaryId);
+            int selIdx = DbEncryption.bindHmac(pstmt, 1, userId);
+            pstmt.setObject(selIdx++, fiduciaryId);
             if (scopedPolicyId != null && !scopedPolicyId.isEmpty()) {
-                pstmt.setString(3, scopedPolicyId);
+                pstmt.setString(selIdx, scopedPolicyId);
             }
             rs = pstmt.executeQuery();
 
@@ -616,20 +689,22 @@ public class Consent implements Action {
 
             // --- 4. Insert New WITHDRAWN Record (Immutability/Provenance) ---
             UUID ropaEntryId = resolveRopaEntryId(conn, fiduciaryId, policyId);
-            String sqlInsertNew = "INSERT INTO consent_records (id, user_id, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, consent_status_general, consent_mechanism, data_point_consents, is_active_consent, created_at,language_selected,ip_address,ropa_entry_id) " +
-                    "VALUES (uuid_generate_v4(), ?, ?, ?, ?, NOW(), 'IN', ?, ?, ?::jsonb, ?, NOW(), 'en', '[0:0:0:0:0:0:0:1]', ?) RETURNING id";
+            String sqlInsertNew = "INSERT INTO consent_records (id, user_id_enc, user_id_hmac, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, consent_status_general, consent_mechanism, data_point_consents, is_active_consent, created_at,language_selected,ip_address_enc,ropa_entry_id) " +
+                    "VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, NOW(), 'IN', ?, ?, ?::jsonb, ?, NOW(), 'en', " + DbEncryption.ENCRYPT + ", ?) RETURNING id";
 
             pstmt.close();
             pstmt = conn.prepareStatement(sqlInsertNew, Statement.RETURN_GENERATED_KEYS);
-            pstmt.setString(1, userId);
-            pstmt.setObject(2, fiduciaryId);
-            pstmt.setString(3, policyId);
-            pstmt.setString(4, policyVersion);
-            pstmt.setString(5, action);
-            pstmt.setString(6, action);
-            pstmt.setString(7, currentConsents.toJSONString());
-            pstmt.setBoolean(8, newIsActive);
-            pstmt.setObject(9, ropaEntryId);
+            int insIdx = DbEncryption.bindEncrypt(pstmt, 1, userId);
+            insIdx = DbEncryption.bindHmac(pstmt, insIdx, userId);
+            pstmt.setObject(insIdx++, fiduciaryId);
+            pstmt.setString(insIdx++, policyId);
+            pstmt.setString(insIdx++, policyVersion);
+            pstmt.setString(insIdx++, action);
+            pstmt.setString(insIdx++, action);
+            pstmt.setString(insIdx++, currentConsents.toJSONString());
+            pstmt.setBoolean(insIdx++, newIsActive);
+            insIdx = DbEncryption.bindEncrypt(pstmt, insIdx, "[0:0:0:0:0:0:0:1]");
+            pstmt.setObject(insIdx++, ropaEntryId);
 
             if (pstmt.executeUpdate() == 0) {
                 throw new SQLException("Creating withdrawal record failed.");
@@ -749,8 +824,8 @@ public class Consent implements Action {
         PoolDB pool = new PoolDB();
         boolean recorded = false;
 
-        String deactivateSql = "UPDATE consent_records SET is_active_consent = FALSE, last_updated_at = NOW() WHERE user_id = ? AND fiduciary_id = ? AND is_active_consent = TRUE";
-        String insertSql = "INSERT INTO consent_records (id, user_id, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, language_selected, consent_status_general, consent_mechanism, ip_address, user_agent, data_point_consents, is_active_consent, created_at, last_updated_at, verification_log_id, ropa_entry_id) VALUES (uuid_generate_v4(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, TRUE, NOW(), NOW(), ?, ?) RETURNING id";
+        String deactivateSql = "UPDATE consent_records SET is_active_consent = FALSE, last_updated_at = NOW() WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? AND is_active_consent = TRUE";
+        String insertSql = "INSERT INTO consent_records (id, user_id_enc, user_id_hmac, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, language_selected, consent_status_general, consent_mechanism, ip_address_enc, user_agent, data_point_consents, is_active_consent, created_at, last_updated_at, verification_log_id, ropa_entry_id) VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, ?, ?, ?, ?, ?, " + DbEncryption.ENCRYPT + ", ?, ?::jsonb, TRUE, NOW(), NOW(), ?, ?) RETURNING id";
 
         try {
             conn = pool.getConnection();
@@ -758,34 +833,31 @@ public class Consent implements Action {
 
             // 1. Deactivate previous active consent for this user and fiduciary
             pstmtDeactivate = conn.prepareStatement(deactivateSql);
-            pstmtDeactivate.setString(1, userId);
-            pstmtDeactivate.setObject(2, fiduciaryId);
+            int deactIdx = DbEncryption.bindHmac(pstmtDeactivate, 1, userId);
+            pstmtDeactivate.setObject(deactIdx, fiduciaryId);
             pstmtDeactivate.executeUpdate();
 
-            // 2. Insert the NEW consent record — hash IP before storage
-            String storedIp = ipAddress;
-            try {
-                storedIp = new LookupHasher().hashData(ipAddress != null ? ipAddress : "0.0.0.0");
-            } catch (Exception ignored) {
-                // TSI_LOOKUP_SALT not set or SHA-256 unavailable — store original
-            }
-
+            // 2. Insert the NEW consent record. IP address is now reversibly encrypted (was
+            // previously one-way LookupHasher-hashed, genuinely irreversible even for an
+            // authorized DPO reveal) — switched so it can be masked-by-default and revealed
+            // on demand via Pii.java, the same as every other identifier in this system.
             UUID ropaEntryId = resolveRopaEntryId(conn, fiduciaryId, policyId);
             pstmtInsert = conn.prepareStatement(insertSql, Statement.RETURN_GENERATED_KEYS);
-            pstmtInsert.setString(1, userId);
-            pstmtInsert.setObject(2, fiduciaryId);
-            pstmtInsert.setString(3, policyId);
-            pstmtInsert.setString(4, policyVersion);
-            pstmtInsert.setTimestamp(5, timestamp);
-            pstmtInsert.setString(6, jurisdiction);
-            pstmtInsert.setString(7, languageSelected);
-            pstmtInsert.setString(8, consentStatusGeneral);
-            pstmtInsert.setString(9, consentMechanism);
-            pstmtInsert.setString(10, storedIp);
-            pstmtInsert.setString(11, userAgent);
-            pstmtInsert.setString(12, dataPointConsents.toJSONString());
-            pstmtInsert.setObject(13, verificationLogId);
-            pstmtInsert.setObject(14, ropaEntryId);
+            int idx = DbEncryption.bindEncrypt(pstmtInsert, 1, userId);
+            idx = DbEncryption.bindHmac(pstmtInsert, idx, userId);
+            pstmtInsert.setObject(idx++, fiduciaryId);
+            pstmtInsert.setString(idx++, policyId);
+            pstmtInsert.setString(idx++, policyVersion);
+            pstmtInsert.setTimestamp(idx++, timestamp);
+            pstmtInsert.setString(idx++, jurisdiction);
+            pstmtInsert.setString(idx++, languageSelected);
+            pstmtInsert.setString(idx++, consentStatusGeneral);
+            pstmtInsert.setString(idx++, consentMechanism);
+            idx = DbEncryption.bindEncrypt(pstmtInsert, idx, ipAddress != null ? ipAddress : "0.0.0.0");
+            pstmtInsert.setString(idx++, userAgent);
+            pstmtInsert.setString(idx++, dataPointConsents.toJSONString());
+            pstmtInsert.setObject(idx++, verificationLogId);
+            pstmtInsert.setObject(idx++, ropaEntryId);
 
             int affectedRows = pstmtInsert.executeUpdate();
             if (affectedRows == 0) {
@@ -827,6 +899,10 @@ public class Consent implements Action {
         if(recorded){
             // Audit Log: Log the consent record event
             JSONObject auditContext = new JSONObject();
+            // Embeds the live record's own id so the console can later cross-reference this
+            // tamper-evident audit entry against the live consent_records row — see
+            // Consent.getConsentAuditEntry / principals.html's "Audit Trail" section.
+            auditContext.put("consent_record_id", output.get("consent_record_id"));
             auditContext.put("policy_id", policyId);
             auditContext.put("policy_version", policyVersion);
             auditContext.put("data_point_consents", dataPointConsents);
@@ -868,23 +944,28 @@ public class Consent implements Action {
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
-        String sql = "SELECT id, user_id, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, language_selected, consent_status_general, consent_mechanism, ip_address, user_agent, data_point_consents, is_active_consent FROM consent_records WHERE user_id = ? AND fiduciary_id = ? AND is_active_consent = TRUE";
+        String sql = "SELECT id, " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, user_id_hmac, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, language_selected, consent_status_general, consent_mechanism, " + DbEncryption.decryptCol("ip_address_enc") + " AS ip_address, user_agent, data_point_consents, is_active_consent FROM consent_records WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? AND is_active_consent = TRUE";
         if (policyId != null && !policyId.isEmpty()) {
             sql += " AND policy_id = ?";
         }
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setString(1, userId);
-            pstmt.setObject(2, fiduciaryId);
+            int idx = DbEncryption.bindKey(pstmt, 1); // user_id decryptCol key
+            idx = DbEncryption.bindKey(pstmt, idx); // ip_address decryptCol key
+            idx = DbEncryption.bindHmac(pstmt, idx, userId); // WHERE user_id_hmac
+            pstmt.setObject(idx++, fiduciaryId);
             if (policyId != null && !policyId.isEmpty()) {
-                pstmt.setString(3, policyId);
+                pstmt.setString(idx, policyId);
             }
             rs = pstmt.executeQuery();
             if (rs.next()) {
                 JSONObject consent = new JSONObject();
                 consent.put("id", rs.getString("id"));
-                consent.put("user_id", rs.getString("user_id"));
+                // Mask by default — this is someone else's identifier being returned to an
+                // operator/app, not an echo of a value the caller just supplied (see record_consent).
+                consent.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                consent.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 consent.put("fiduciary_id", rs.getString("fiduciary_id"));
                 consent.put("policy_id", rs.getString("policy_id"));
                 consent.put("policy_version", rs.getString("policy_version"));
@@ -893,7 +974,9 @@ public class Consent implements Action {
                 consent.put("language_selected", rs.getString("language_selected"));
                 consent.put("consent_status_general", rs.getString("consent_status_general"));
                 consent.put("consent_mechanism", rs.getString("consent_mechanism"));
-                consent.put("ip_address", rs.getString("ip_address")); // INET is read as String
+                // Mask by default — IP is now reversibly encrypted (was one-way hashed before this
+                // fix); reveal via Pii.java source=consent_record, same as user_id.
+                consent.put("ip_address", PiiMasking.mask(rs.getString("ip_address")));
                 consent.put("user_agent", rs.getString("user_agent"));
                 consent.put("data_point_consents", new JSONParser().parse(rs.getString("data_point_consents"))); // Parse JSONB
                 consent.put("is_active_consent", rs.getBoolean("is_active_consent"));
@@ -917,9 +1000,9 @@ public class Consent implements Action {
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
-        String sql = "SELECT cr.id, cr.user_id, cr.fiduciary_id, cr.policy_id, cr.policy_version, cr.timestamp, " +
+        String sql = "SELECT cr.id, " + DbEncryption.decryptCol("cr.user_id_enc") + " AS user_id, cr.user_id_hmac, cr.fiduciary_id, cr.policy_id, cr.policy_version, cr.timestamp, " +
                 "cr.jurisdiction, cr.language_selected, cr.consent_status_general, cr.consent_mechanism, " +
-                "cr.ip_address, cr.user_agent, cr.data_point_consents, cr.is_active_consent, " +
+                DbEncryption.decryptCol("cr.ip_address_enc") + " AS ip_address, cr.user_agent, cr.data_point_consents, cr.is_active_consent, " +
                 "cr.ropa_entry_id, re.activity_name AS ropa_activity_name " +
                 "FROM consent_records cr " +
                 "LEFT JOIN ropa_entries re ON re.id = cr.ropa_entry_id " +
@@ -927,12 +1010,15 @@ public class Consent implements Action {
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, recordId);
+            int idx = DbEncryption.bindKey(pstmt, 1); // user_id decryptCol key
+            idx = DbEncryption.bindKey(pstmt, idx); // ip_address decryptCol key
+            pstmt.setObject(idx, recordId);
             rs = pstmt.executeQuery();
             if (rs.next()) {
                 JSONObject consent = new JSONObject();
                 consent.put("id", rs.getString("id"));
-                consent.put("user_id", rs.getString("user_id"));
+                consent.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                consent.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 consent.put("fiduciary_id", rs.getString("fiduciary_id"));
                 consent.put("policy_id", rs.getString("policy_id"));
                 consent.put("policy_version", rs.getString("policy_version"));
@@ -941,7 +1027,9 @@ public class Consent implements Action {
                 consent.put("language_selected", rs.getString("language_selected"));
                 consent.put("consent_status_general", rs.getString("consent_status_general"));
                 consent.put("consent_mechanism", rs.getString("consent_mechanism"));
-                consent.put("ip_address", rs.getString("ip_address")); // INET is read as String
+                // Mask by default — IP is now reversibly encrypted (was one-way hashed before this
+                // fix); reveal via Pii.java source=consent_record, same as user_id.
+                consent.put("ip_address", PiiMasking.mask(rs.getString("ip_address")));
                 consent.put("user_agent", rs.getString("user_agent"));
                 consent.put("data_point_consents", new JSONParser().parse(rs.getString("data_point_consents"))); // Parse JSONB
                 consent.put("is_active_consent", rs.getBoolean("is_active_consent"));
@@ -958,6 +1046,62 @@ public class Consent implements Action {
         return Optional.empty();
     }
 
+    /**
+     * Finds the tamper-evident audit_logs (or archived-partition) row for a given
+     * consent_records.id, matched via the consent_record_id embedded in that entry's
+     * context_details (recordConsentToDb). Lets a DPO confirm the live row's granular
+     * data_point_consents actually matches what was logged as consented at the time — independent
+     * verification via the hash chain, the same principle Legal.generate_certificate uses, just
+     * scoped to a single record instead of a whole subject's history.
+     *
+     * Uses a plain LIKE match rather than a ::jsonb cast on context_details — not every audit_logs
+     * row's context_details is JSON (e.g. plain strings like "Operator Access Granted" for other
+     * actions), and Postgres does not guarantee the audit_action filter is evaluated before a cast
+     * elsewhere in the WHERE clause, so an unconditional ::jsonb cast risks throwing on unrelated
+     * rows. Only CONSENT_GIVEN rows ever contain this key, and consent_record_id is a UUID string
+     * with no characters that need escaping for a LIKE pattern.
+     *
+     * Older consent records recorded before this fix (2026-08-13) have no consent_record_id in
+     * their audit context and simply won't be found here — that's a real, permanent gap for that
+     * historical data (the audit context itself is what's hash-chained; it can't be retroactively
+     * edited to add the field without invalidating every downstream hash).
+     */
+    private Optional<JSONObject> getConsentAuditEntryFromDb(UUID recordId, UUID fiduciaryId) throws SQLException {
+        PoolDB pool = new PoolDB();
+        Connection conn = null;
+        PreparedStatement pstmt = null;
+        ResultSet rs = null;
+        try {
+            conn = pool.getConnection();
+            String sql = "SELECT timestamp, current_log_hash, prev_log_hash, context_details FROM " +
+                    Audit.auditLogsUnionSource(conn) +
+                    " WHERE audit_action = 'CONSENT_GIVEN' AND fiduciary_id = ? AND context_details LIKE ? " +
+                    "ORDER BY timestamp DESC LIMIT 1";
+            pstmt = conn.prepareStatement(sql);
+            pstmt.setObject(1, fiduciaryId);
+            pstmt.setString(2, "%\"consent_record_id\":\"" + recordId + "\"%");
+            rs = pstmt.executeQuery();
+            if (rs.next()) {
+                JSONObject entry = new JSONObject();
+                entry.put("timestamp", rs.getTimestamp("timestamp").toInstant().toString());
+                entry.put("current_hash", rs.getString("current_log_hash"));
+                entry.put("prev_hash", rs.getString("prev_log_hash"));
+                try {
+                    JSONObject context = (JSONObject) new JSONParser().parse(rs.getString("context_details"));
+                    entry.put("policy_id", context.get("policy_id"));
+                    entry.put("policy_version", context.get("policy_version"));
+                    entry.put("data_point_consents", context.get("data_point_consents"));
+                } catch (Exception ignored) {
+                    // Shouldn't happen for a CONSENT_GIVEN row, but never fail the whole response
+                    // over a malformed context blob — the hash fields above are still useful.
+                }
+                return Optional.of(entry);
+            }
+        } finally {
+            pool.cleanup(rs, pstmt, conn);
+        }
+        return Optional.empty();
+    }
 
     /**
      * Retrieves a list of consent records for a given user and fiduciary (history).
@@ -971,25 +1115,26 @@ public class Consent implements Action {
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
 
-        StringBuilder sqlBuilder = new StringBuilder("SELECT id, user_id, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, language_selected, consent_status_general, consent_mechanism, ip_address, user_agent, data_point_consents, is_active_consent FROM consent_records WHERE user_id = ? AND fiduciary_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?");
-        List<Object> params = new ArrayList<>();
-        params.add(userId);
-        params.add(fiduciaryId);
-        params.add(limit);
-        params.add((page - 1) * limit);
+        StringBuilder sqlBuilder = new StringBuilder("SELECT id, " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, user_id_hmac, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, language_selected, consent_status_general, consent_mechanism, " + DbEncryption.decryptCol("ip_address_enc") + " AS ip_address, user_agent, data_point_consents, is_active_consent FROM consent_records WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?");
 
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sqlBuilder.toString());
-            for (int i = 0; i < params.size(); i++) {
-                pstmt.setObject(i + 1, params.get(i));
-            }
+            int idx = DbEncryption.bindKey(pstmt, 1); // user_id decryptCol key
+            idx = DbEncryption.bindKey(pstmt, idx); // ip_address decryptCol key
+            idx = DbEncryption.bindHmac(pstmt, idx, userId); // WHERE user_id_hmac
+            pstmt.setObject(idx++, fiduciaryId);
+            pstmt.setObject(idx++, limit);
+            pstmt.setObject(idx++, (page - 1) * limit);
             rs = pstmt.executeQuery();
 
             while (rs.next()) {
                 JSONObject consent = new JSONObject();
                 consent.put("id", rs.getString("id"));
-                consent.put("user_id", rs.getString("user_id"));
+                // Real (unmasked) value needed for sync_token generation before we mask for display.
+                String realUserId = rs.getString("user_id");
+                consent.put("user_id", PiiMasking.mask(realUserId));
+                consent.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 consent.put("fiduciary_id", rs.getString("fiduciary_id"));
                 consent.put("policy_id", rs.getString("policy_id"));
                 consent.put("policy_version", rs.getString("policy_version"));
@@ -998,11 +1143,13 @@ public class Consent implements Action {
                 consent.put("language_selected", rs.getString("language_selected"));
                 consent.put("consent_status_general", rs.getString("consent_status_general"));
                 consent.put("consent_mechanism", rs.getString("consent_mechanism"));
-                consent.put("ip_address", rs.getString("ip_address"));
+                // Mask by default — IP is now reversibly encrypted (was one-way hashed before this
+                // fix); reveal via Pii.java source=consent_record, same as user_id.
+                consent.put("ip_address", PiiMasking.mask(rs.getString("ip_address")));
                 consent.put("user_agent", rs.getString("user_agent"));
                 consent.put("data_point_consents", new JSONParser().parse(rs.getString("data_point_consents")));
                 consent.put("is_active_consent", rs.getBoolean("is_active_consent"));
-                consent.put("sync_token", JWTUtil.generateSyncToken(rs.getString("user_id"), rs.getString("fiduciary_id")));
+                consent.put("sync_token", JWTUtil.generateSyncToken(realUserId, rs.getString("fiduciary_id")));
                 historyArray.add(consent);
             }
         } catch (ParseException e) {
@@ -1025,19 +1172,25 @@ public class Consent implements Action {
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
 
-        String sql = "SELECT user_id, last_consent_mechanism, age_category, verification_status, created_at, last_ces_run " +
+        String sql = "SELECT " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, user_id_hmac, last_consent_mechanism, age_category, verification_status, created_at, last_ces_run " +
                 "FROM data_principal WHERE fiduciary_id = ? ORDER BY created_at DESC LIMIT ?";
 
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, fiduciaryId);
-            pstmt.setInt(2, limit);
+            int idx = DbEncryption.bindKey(pstmt, 1); // decryptCol key
+            pstmt.setObject(idx++, fiduciaryId);
+            pstmt.setInt(idx++, limit);
             rs = pstmt.executeQuery();
 
             while (rs.next()) {
                 JSONObject principal = new JSONObject();
-                principal.put("user_id", rs.getString("user_id"));
+                // Mask by default — the DPO didn't supply this identifier, it's being shown to them.
+                principal.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                // Opaque handle for drill-down (list_consent_history etc.) without re-exposing plaintext.
+                // Truncated to 16 hex chars — negligible collision risk within a single fiduciary's scope.
+                String hmac = rs.getString("user_id_hmac");
+                principal.put("user_ref", hmac != null ? hmac.substring(0, 16) : null);
                 principal.put("last_consent_mechanism", rs.getString("last_consent_mechanism"));
                 principal.put("age_category", rs.getString("age_category"));
                 principal.put("verification_status", rs.getString("verification_status"));
@@ -1062,7 +1215,7 @@ public class Consent implements Action {
         PreparedStatement pstmtUpdateConsent = null;
         PreparedStatement pstmtDeactivate = null;
         PoolDB pool = new PoolDB();
-        String deactivateSql = "UPDATE consent_records SET is_active_consent = FALSE, last_updated_at = NOW() WHERE user_id = ? AND fiduciary_id = ? AND is_active_consent = TRUE";
+        String deactivateSql = "UPDATE consent_records SET is_active_consent = FALSE, last_updated_at = NOW() WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ? AND is_active_consent = TRUE";
         String effectiveAge = (ageCategory != null) ? ageCategory : "ADULT";
         String effectiveVStatus = (verificationStatus != null) ? verificationStatus : "NOT_VERIFIED";
 
@@ -1072,29 +1225,47 @@ public class Consent implements Action {
 
             // Deactivate previous active consent for this authenticated user and fiduciary (if any)
             pstmtDeactivate = conn.prepareStatement(deactivateSql);
-            pstmtDeactivate.setString(1, authenticatedUserId);
-            pstmtDeactivate.setObject(2, fiduciaryId);
+            int deactIdx = DbEncryption.bindHmac(pstmtDeactivate, 1, authenticatedUserId);
+            pstmtDeactivate.setObject(deactIdx, fiduciaryId);
             pstmtDeactivate.executeUpdate();
 
-            // Update Consent Record
-            String updateConsentSql = "UPDATE consent_records SET user_id = ?, last_updated_at = NOW() WHERE user_id = ?";
+            // Update Consent Record — relinks the anonymous ID's records to the authenticated ID.
+            // Bug fix (2026-08-13): the original SQL had no fiduciary_id filter, so an anonymous
+            // ID that happened to collide across two unrelated fiduciaries would be relinked in
+            // both at once. Scoping by fiduciary_id closes that cross-tenant leak.
+            String updateConsentSql = "UPDATE consent_records SET user_id_enc = " + DbEncryption.ENCRYPT + ", user_id_hmac = " + DbEncryption.HMAC +
+                    ", last_updated_at = NOW() WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id = ?";
             pstmtUpdateConsent = conn.prepareStatement(updateConsentSql);
-            pstmtUpdateConsent.setString(1, authenticatedUserId);
-            pstmtUpdateConsent.setString(2, anonymousUserId);
+            int upIdx = DbEncryption.bindEncrypt(pstmtUpdateConsent, 1, authenticatedUserId);
+            upIdx = DbEncryption.bindHmac(pstmtUpdateConsent, upIdx, authenticatedUserId);
+            upIdx = DbEncryption.bindHmac(pstmtUpdateConsent, upIdx, anonymousUserId);
+            pstmtUpdateConsent.setObject(upIdx, fiduciaryId);
             pstmtUpdateConsent.executeUpdate();
 
             // 3. Upsert Data Principal with Minor Metadata
-            String upsertSql = "INSERT INTO data_principal (user_id, fiduciary_id, age_category, guardian_id, verification_status) " +
-                    "VALUES (?, ?, ?, ?, ?) " +
-                    "ON CONFLICT (user_id, fiduciary_id) DO UPDATE SET " +
-                    "age_category = EXCLUDED.age_category, guardian_id = EXCLUDED.guardian_id, verification_status = EXCLUDED.verification_status";
+            String upsertSql;
+            if (guardianId != null) {
+                upsertSql = "INSERT INTO data_principal (user_id_enc, user_id_hmac, fiduciary_id, age_category, guardian_id_enc, guardian_id_hmac, verification_status) " +
+                        "VALUES (" + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?) " +
+                        "ON CONFLICT (user_id_hmac, fiduciary_id) DO UPDATE SET " +
+                        "age_category = EXCLUDED.age_category, guardian_id_enc = EXCLUDED.guardian_id_enc, guardian_id_hmac = EXCLUDED.guardian_id_hmac, verification_status = EXCLUDED.verification_status";
+            } else {
+                upsertSql = "INSERT INTO data_principal (user_id_enc, user_id_hmac, fiduciary_id, age_category, guardian_id_enc, guardian_id_hmac, verification_status) " +
+                        "VALUES (" + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, NULL, NULL, ?) " +
+                        "ON CONFLICT (user_id_hmac, fiduciary_id) DO UPDATE SET " +
+                        "age_category = EXCLUDED.age_category, guardian_id_enc = EXCLUDED.guardian_id_enc, guardian_id_hmac = EXCLUDED.guardian_id_hmac, verification_status = EXCLUDED.verification_status";
+            }
 
             try (PreparedStatement pstmt = conn.prepareStatement(upsertSql)) {
-                pstmt.setString(1, authenticatedUserId);
-                pstmt.setObject(2, fiduciaryId);
-                pstmt.setString(3, effectiveAge);
-                pstmt.setString(4, guardianId);
-                pstmt.setString(5, effectiveVStatus);
+                int pIdx = DbEncryption.bindEncrypt(pstmt, 1, authenticatedUserId);
+                pIdx = DbEncryption.bindHmac(pstmt, pIdx, authenticatedUserId);
+                pstmt.setObject(pIdx++, fiduciaryId);
+                pstmt.setString(pIdx++, effectiveAge);
+                if (guardianId != null) {
+                    pIdx = DbEncryption.bindEncrypt(pstmt, pIdx, guardianId);
+                    pIdx = DbEncryption.bindHmac(pstmt, pIdx, guardianId);
+                }
+                pstmt.setString(pIdx++, effectiveVStatus);
                 pstmt.executeUpdate();
             }
 
@@ -1115,8 +1286,8 @@ public class Consent implements Action {
         // Audit Log: Log the link user event
         JSONObject auditContext = new JSONObject();
         auditContext.put("action", Constants.ACTION_LINK_USER);
-        auditContext.put("anonymous_id", anonymousUserId);
-        auditContext.put("principal", authenticatedUserId);
+        auditContext.put("anonymous_id", PiiMasking.mask(anonymousUserId));
+        auditContext.put("principal", PiiMasking.mask(authenticatedUserId));
         new Audit().logEventAsync(authenticatedUserId, fiduciaryId, Constants.SERVICE_TYPE_APP, appId , Constants.ACTION_LINK_USER, auditContext.toJSONString());
     }
 

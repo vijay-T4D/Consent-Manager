@@ -94,13 +94,13 @@ public class Wallet implements Action {
         PoolDB pool = new PoolDB();
 
         String sql = "SELECT data_point_consents, policy_id, policy_version, timestamp FROM consent_records " +
-                "WHERE user_id = ? AND fiduciary_id::text = ? AND is_active_consent = TRUE LIMIT 1";
+                "WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id::text = ? AND is_active_consent = TRUE LIMIT 1";
 
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setString(1, ctx.userId);
-            pstmt.setString(2, ctx.fiduciaryId);
+            int idx = DbEncryption.bindHmac(pstmt, 1, ctx.userId);
+            pstmt.setString(idx, ctx.fiduciaryId);
             rs = pstmt.executeQuery();
 
             JSONObject res = new JSONObject();
@@ -149,15 +149,15 @@ public class Wallet implements Action {
         PoolDB pool = new PoolDB();
 
         String selectSql = "SELECT id, policy_id, policy_version, data_point_consents FROM consent_records " +
-                "WHERE user_id = ? AND fiduciary_id::text = ? AND is_active_consent = TRUE LIMIT 1";
+                "WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id::text = ? AND is_active_consent = TRUE LIMIT 1";
 
         try {
             conn = pool.getConnection();
             conn.setAutoCommit(false);
 
             pstmt = conn.prepareStatement(selectSql);
-            pstmt.setString(1, ctx.userId);
-            pstmt.setString(2, ctx.fiduciaryId);
+            int selIdx = DbEncryption.bindHmac(pstmt, 1, ctx.userId);
+            pstmt.setString(selIdx, ctx.fiduciaryId);
             rs = pstmt.executeQuery();
 
             if (!rs.next()) throw new Exception("No active record found to revoke.");
@@ -181,13 +181,16 @@ public class Wallet implements Action {
                 dStmt.executeUpdate();
             }
 
-            String iSql = "INSERT INTO consent_records (id, user_id, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, consent_status_general, consent_mechanism, data_point_consents, is_active_consent, created_at, language_selected, ip_address) VALUES (uuid_generate_v4(), ?, ?, ?, ?, NOW(), 'IN', 'WITHDRAWN', 'WALLET_REVOKE', ?::jsonb, TRUE, NOW(), 'en', '0.0.0.0')";
+            String iSql = "INSERT INTO consent_records (id, user_id_enc, user_id_hmac, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, consent_status_general, consent_mechanism, data_point_consents, is_active_consent, created_at, language_selected, ip_address_enc) VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, NOW(), 'IN', 'WITHDRAWN', 'WALLET_REVOKE', ?::jsonb, TRUE, NOW(), 'en', " + DbEncryption.ENCRYPT + ")";
             try (PreparedStatement iStmt = conn.prepareStatement(iSql)) {
-                iStmt.setString(1, ctx.userId);
-                try { iStmt.setObject(2, UUID.fromString(ctx.fiduciaryId)); } catch (Exception ex) { iStmt.setString(2, ctx.fiduciaryId); }
-                iStmt.setString(3, pId);
-                iStmt.setString(4, pVer);
-                iStmt.setString(5, consents.toJSONString());
+                int iIdx = DbEncryption.bindEncrypt(iStmt, 1, ctx.userId);
+                iIdx = DbEncryption.bindHmac(iStmt, iIdx, ctx.userId);
+                try { iStmt.setObject(iIdx, UUID.fromString(ctx.fiduciaryId)); } catch (Exception ex) { iStmt.setString(iIdx, ctx.fiduciaryId); }
+                iIdx++;
+                iStmt.setString(iIdx++, pId);
+                iStmt.setString(iIdx++, pVer);
+                iStmt.setString(iIdx++, consents.toJSONString());
+                iIdx = DbEncryption.bindEncrypt(iStmt, iIdx, "0.0.0.0");
                 iStmt.executeUpdate();
             }
 
@@ -209,14 +212,14 @@ public class Wallet implements Action {
         PreparedStatement pstmt = null;
         ResultSet rs = null;
         PoolDB pool = new PoolDB();
-        String sSql = "SELECT id, policy_id, policy_version, data_point_consents FROM consent_records WHERE user_id = ? AND fiduciary_id::text = ? AND is_active_consent = TRUE LIMIT 1";
+        String sSql = "SELECT id, policy_id, policy_version, data_point_consents FROM consent_records WHERE user_id_hmac = " + DbEncryption.HMAC + " AND fiduciary_id::text = ? AND is_active_consent = TRUE LIMIT 1";
 
         try {
             conn = pool.getConnection();
             conn.setAutoCommit(false);
             pstmt = conn.prepareStatement(sSql);
-            pstmt.setString(1, ctx.userId);
-            pstmt.setString(2, ctx.fiduciaryId);
+            int idx = DbEncryption.bindHmac(pstmt, 1, ctx.userId);
+            pstmt.setString(idx, ctx.fiduciaryId);
             rs = pstmt.executeQuery();
 
             if (rs.next()) {
@@ -237,13 +240,16 @@ public class Wallet implements Action {
                     dStmt.executeUpdate();
                 }
 
-                String iSql = "INSERT INTO consent_records (id, user_id, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, consent_status_general, consent_mechanism, data_point_consents, is_active_consent, created_at, language_selected, ip_address) VALUES (uuid_generate_v4(), ?, ?, ?, ?, NOW(), 'IN', 'ERASURE_REQUEST', 'ERASURE_REQUEST', ?::jsonb, FALSE, NOW(), 'en', '0.0.0.0')";
+                String iSql = "INSERT INTO consent_records (id, user_id_enc, user_id_hmac, fiduciary_id, policy_id, policy_version, timestamp, jurisdiction, consent_status_general, consent_mechanism, data_point_consents, is_active_consent, created_at, language_selected, ip_address_enc) VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, NOW(), 'IN', 'ERASURE_REQUEST', 'ERASURE_REQUEST', ?::jsonb, FALSE, NOW(), 'en', " + DbEncryption.ENCRYPT + ")";
                 try (PreparedStatement iStmt = conn.prepareStatement(iSql)) {
-                    iStmt.setString(1, ctx.userId);
-                    try { iStmt.setObject(2, UUID.fromString(ctx.fiduciaryId)); } catch (Exception ex) { iStmt.setString(2, ctx.fiduciaryId); }
-                    iStmt.setString(3, pId);
-                    iStmt.setString(4, pVer);
-                    iStmt.setString(5, consents.toJSONString());
+                    int iIdx = DbEncryption.bindEncrypt(iStmt, 1, ctx.userId);
+                    iIdx = DbEncryption.bindHmac(iStmt, iIdx, ctx.userId);
+                    try { iStmt.setObject(iIdx, UUID.fromString(ctx.fiduciaryId)); } catch (Exception ex) { iStmt.setString(iIdx, ctx.fiduciaryId); }
+                    iIdx++;
+                    iStmt.setString(iIdx++, pId);
+                    iStmt.setString(iIdx++, pVer);
+                    iStmt.setString(iIdx++, consents.toJSONString());
+                    iIdx = DbEncryption.bindEncrypt(iStmt, iIdx, "0.0.0.0");
                     iStmt.executeUpdate();
                 }
             }

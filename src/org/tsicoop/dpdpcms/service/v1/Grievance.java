@@ -139,6 +139,15 @@ public class Grievance implements Action {
         String subject = (String) input.get("subject");
         String description = (String) input.get("description");
         JSONArray attachments = (JSONArray) input.get("attachments");
+        // How the grievance reached the fiduciary. Principal-submitted calls (client API key /
+        // principal JWT) never send this, so it defaults to PORTAL; the DPO console's "Log
+        // Grievance" form sends EMAIL/PHONE/LETTER/IN_PERSON/OTHER explicitly for one raised
+        // outside the app. Not user-facing security-sensitive, so no whitelist needed beyond
+        // the column's own VARCHAR(20) bound.
+        String channel = (String) input.get("channel");
+        if (channel == null || channel.trim().isEmpty()) {
+            channel = "PORTAL";
+        }
 
         if (userId == null || fiduciaryId == null || type == null || subject == null || description == null) {
             OutputProcessor.errorResponse(res, 400, "Bad Request", "Missing mandatory fields.", req.getRequestURI());
@@ -157,18 +166,20 @@ public class Grievance implements Action {
 
         try {
             conn = pool.getConnection();
-            String sql = "INSERT INTO grievances (id, user_id, fiduciary_id, type, subject, description, submission_timestamp, status, communication_log, attachments, due_date, last_updated_at) " +
-                    "VALUES (uuid_generate_v4(), ?, ?, ?, ?, ?, ?, 'NEW', '[]'::jsonb, ?::jsonb, ?, NOW()) RETURNING id";
+            String sql = "INSERT INTO grievances (id, user_id_enc, user_id_hmac, fiduciary_id, type, subject, description, submission_timestamp, status, communication_log, attachments, due_date, last_updated_at, channel) " +
+                    "VALUES (uuid_generate_v4(), " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ", ?, ?, ?, ?, ?, 'NEW', '[]'::jsonb, ?::jsonb, ?, NOW(), ?) RETURNING id";
 
             pstmt = conn.prepareStatement(sql);
-            pstmt.setString(1, userId);
-            pstmt.setObject(2, fiduciaryId);
-            pstmt.setString(3, type);
-            pstmt.setString(4, subject);
-            pstmt.setString(5, description);
-            pstmt.setTimestamp(6, submissionTime);
-            pstmt.setString(7, attachments != null ? attachments.toJSONString() : "[]");
-            pstmt.setTimestamp(8, dueDate);
+            int idx = DbEncryption.bindEncrypt(pstmt, 1, userId);
+            idx = DbEncryption.bindHmac(pstmt, idx, userId);
+            pstmt.setObject(idx++, fiduciaryId);
+            pstmt.setString(idx++, type);
+            pstmt.setString(idx++, subject);
+            pstmt.setString(idx++, description);
+            pstmt.setTimestamp(idx++, submissionTime);
+            pstmt.setString(idx++, attachments != null ? attachments.toJSONString() : "[]");
+            pstmt.setTimestamp(idx++, dueDate);
+            pstmt.setString(idx++, channel);
 
             rs = pstmt.executeQuery();
             if (rs.next()) {
@@ -185,7 +196,7 @@ public class Grievance implements Action {
 
         // Audit Log: Instrument after cleanup. Audit user is the principal (userId).
         if (success) {
-            new Audit().logEventAsync(userId, fiduciaryId, serviceType, serviceId, "GRIEVANCE_SUBMITTED", "Subject: " + subject);
+            new Audit().logEventAsync(userId, fiduciaryId, serviceType, serviceId, "GRIEVANCE_SUBMITTED", "Subject: " + subject + " | Channel: " + channel);
             try {
                 new CESService().insertNotification("PRINCIPAL", userId, fiduciaryId.toString(), Constants.NOTIF_GRIEVANCE_SUBMITTED);
             } catch (SQLException e) {
@@ -216,10 +227,12 @@ public class Grievance implements Action {
             conn = pool.getConnection();
             // Fetch metadata for audit context, and the current assignee for Operator scoping
             UUID assignedDpoUserId = null;
-            try (PreparedStatement p = conn.prepareStatement("SELECT user_id, fiduciary_id, assigned_dpo_user_id FROM grievances WHERE id = ?")) {
-                p.setObject(1, grievanceId);
+            try (PreparedStatement p = conn.prepareStatement("SELECT " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, fiduciary_id, assigned_dpo_user_id FROM grievances WHERE id = ?")) {
+                int pIdx = DbEncryption.bindKey(p, 1);
+                p.setObject(pIdx, grievanceId);
                 try (ResultSet r = p.executeQuery()) {
                     if (r.next()) {
+                        // Internal use only (audit context) — never sent to the console, so left unmasked.
                         principalId = r.getString("user_id");
                         fiduciaryId = (UUID) r.getObject("fiduciary_id");
                         assignedDpoUserId = (UUID) r.getObject("assigned_dpo_user_id");
@@ -280,8 +293,9 @@ public class Grievance implements Action {
         ResultSet rs = null;
         try {
             conn = pool.getConnection();
-            pstmt = conn.prepareStatement("SELECT * FROM grievances WHERE id = ?");
-            pstmt.setObject(1, id);
+            pstmt = conn.prepareStatement("SELECT id, " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, user_id_hmac, fiduciary_id, type, status, subject, description, submission_timestamp, due_date, assigned_dpo_user_id, resolution_details, resolution_timestamp, communication_log, attachments, channel FROM grievances WHERE id = ?");
+            int gIdx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setObject(gIdx, id);
             rs = pstmt.executeQuery();
             if (rs.next()) {
                 UUID assignedDpoUserId = (UUID) rs.getObject("assigned_dpo_user_id");
@@ -292,13 +306,16 @@ public class Grievance implements Action {
                 }
                 JSONObject g = new JSONObject();
                 g.put("grievance_id", rs.getString("id"));
-                g.put("user_id", rs.getString("user_id"));
+                // Mask by default — the operator viewing this didn't supply the identifier.
+                g.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                g.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 g.put("status", rs.getString("status"));
                 g.put("subject", rs.getString("subject"));
                 g.put("description", rs.getString("description"));
                 g.put("submission_timestamp", rs.getTimestamp("submission_timestamp").toString());
                 g.put("due_date", rs.getTimestamp("due_date").toString());
                 g.put("assigned_dpo_user_id", assignedDpoUserId != null ? assignedDpoUserId.toString() : null);
+                g.put("channel", rs.getString("channel"));
                 try {
                     g.put("communication_log", new JSONParser().parse(rs.getString("communication_log")));
                     g.put("attachments", new JSONParser().parse(rs.getString("attachments")));
@@ -323,21 +340,24 @@ public class Grievance implements Action {
         boolean scopeToCaller = "OPERATOR".equalsIgnoreCase(callerRole);
 
         try {
-            String sql = "SELECT id, user_id, type, subject, submission_timestamp, status, due_date, assigned_dpo_user_id FROM grievances WHERE fiduciary_id = ?"
+            String sql = "SELECT id, " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, user_id_hmac, type, subject, submission_timestamp, status, due_date, assigned_dpo_user_id, channel FROM grievances WHERE fiduciary_id = ?"
                     + (scopeToCaller ? " AND assigned_dpo_user_id = ?" : "")
                     + " ORDER BY submission_timestamp DESC";
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, fiduciaryId);
+            int idx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setObject(idx++, fiduciaryId);
             if (scopeToCaller) {
-                pstmt.setObject(2, loginUserId);
+                pstmt.setObject(idx++, loginUserId);
             }
             rs = pstmt.executeQuery();
 
             while (rs.next()) {
                 JSONObject g = new JSONObject();
                 g.put("grievance_id", rs.getString("id"));
-                g.put("user_id", rs.getString("user_id"));
+                // Mask by default — this is the DPO/operator list view, not a self-service echo.
+                g.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                g.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 g.put("type", rs.getString("type"));
                 g.put("subject", rs.getString("subject"));
                 g.put("status", rs.getString("status"));
@@ -345,6 +365,7 @@ public class Grievance implements Action {
                 g.put("due_date", rs.getTimestamp("due_date").toString());
                 Object assignedId = rs.getObject("assigned_dpo_user_id");
                 g.put("assigned_dpo_user_id", assignedId != null ? assignedId.toString() : null);
+                g.put("channel", rs.getString("channel"));
                 arr.add(g);
             }
             OutputProcessor.send(res, 200, arr);
@@ -378,10 +399,12 @@ public class Grievance implements Action {
 
         try {
             conn = pool.getConnection();
-            try (PreparedStatement p = conn.prepareStatement("SELECT user_id, fiduciary_id FROM grievances WHERE id = ?")) {
-                p.setObject(1, grievanceId);
+            try (PreparedStatement p = conn.prepareStatement("SELECT " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, fiduciary_id FROM grievances WHERE id = ?")) {
+                int pIdx = DbEncryption.bindKey(p, 1);
+                p.setObject(pIdx, grievanceId);
                 try (ResultSet r = p.executeQuery()) {
                     if (r.next()) {
+                        // Internal use only (audit context) — never sent to the console, so left unmasked.
                         principalId = r.getString("user_id");
                         fiduciaryId = (UUID) r.getObject("fiduciary_id");
                     }
@@ -420,11 +443,12 @@ public class Grievance implements Action {
         JSONArray arr = new JSONArray();
 
         try {
-            String sql = "SELECT id, type, subject, status, submission_timestamp, due_date FROM grievances WHERE fiduciary_id = ? AND user_id = ? ORDER BY submission_timestamp DESC";
+            // Self-service (principal's own grievances) — no masking here, the caller IS the subject.
+            String sql = "SELECT id, type, subject, status, submission_timestamp, due_date FROM grievances WHERE fiduciary_id = ? AND user_id_hmac = " + DbEncryption.HMAC + " ORDER BY submission_timestamp DESC";
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
             pstmt.setObject(1, fiduciaryId);
-            pstmt.setString(2, userId);
+            DbEncryption.bindHmac(pstmt, 2, userId);
             rs = pstmt.executeQuery();
 
             while (rs.next()) {

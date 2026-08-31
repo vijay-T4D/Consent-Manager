@@ -260,12 +260,13 @@ public class Breach implements Action {
             }
 
             if (!affectedUserIds.isEmpty()) {
-                String sqlAffected = "INSERT INTO breach_affected_principals (breach_id, user_id) VALUES (?, ?)";
+                String sqlAffected = "INSERT INTO breach_affected_principals (breach_id, user_id_enc, user_id_hmac) VALUES (?, " + DbEncryption.ENCRYPT + ", " + DbEncryption.HMAC + ")";
                 pstmt.close();
                 pstmt = conn.prepareStatement(sqlAffected);
                 for (String userId : affectedUserIds) {
                     pstmt.setObject(1, breachId);
-                    pstmt.setString(2, userId);
+                    int idx = DbEncryption.bindEncrypt(pstmt, 2, userId);
+                    DbEncryption.bindHmac(pstmt, idx, userId);
                     pstmt.addBatch();
                 }
                 pstmt.executeBatch();
@@ -335,7 +336,10 @@ public class Breach implements Action {
      */
     private List<String> resolveAffectedPrincipalsByPurpose(UUID fiduciaryId, String purposeId) throws SQLException {
         List<String> userIds = new ArrayList<>();
-        String sql = "SELECT DISTINCT user_id FROM consent_records cr " +
+        // Internal enumeration only (feeds notification fan-out above) — never returned to the
+        // console, so the real (decrypted) user_id is used directly, same as CESService's internal
+        // lookups.
+        String sql = "SELECT DISTINCT " + DbEncryption.decryptCol("cr.user_id_enc") + " AS user_id FROM consent_records cr " +
                 "WHERE cr.fiduciary_id = ? AND cr.is_active_consent = TRUE " +
                 "AND EXISTS (SELECT 1 FROM jsonb_array_elements(cr.data_point_consents) elem " +
                 "WHERE elem->>'data_point_id' = ? AND (elem->>'consent_granted')::boolean = TRUE)";
@@ -347,8 +351,9 @@ public class Breach implements Action {
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, fiduciaryId);
-            pstmt.setString(2, purposeId);
+            int idx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setObject(idx++, fiduciaryId);
+            pstmt.setString(idx++, purposeId);
             rs = pstmt.executeQuery();
             while (rs.next()) {
                 userIds.add(rs.getString("user_id"));
@@ -451,7 +456,7 @@ public class Breach implements Action {
 
     private JSONArray listAffectedPrincipals(UUID breachId) throws SQLException {
         JSONArray result = new JSONArray();
-        String sql = "SELECT user_id, notified_at FROM breach_affected_principals WHERE breach_id = ? ORDER BY notified_at ASC";
+        String sql = "SELECT " + DbEncryption.decryptCol("user_id_enc") + " AS user_id, user_id_hmac, notified_at FROM breach_affected_principals WHERE breach_id = ? ORDER BY notified_at ASC";
         PoolDB pool = new PoolDB();
         Connection conn = null;
         PreparedStatement pstmt = null;
@@ -459,11 +464,14 @@ public class Breach implements Action {
         try {
             conn = pool.getConnection();
             pstmt = conn.prepareStatement(sql);
-            pstmt.setObject(1, breachId);
+            int idx = DbEncryption.bindKey(pstmt, 1);
+            pstmt.setObject(idx, breachId);
             rs = pstmt.executeQuery();
             while (rs.next()) {
                 JSONObject row = new JSONObject();
-                row.put("user_id", rs.getString("user_id"));
+                // Mask by default — this is the DPO console's affected-principals list.
+                row.put("user_id", PiiMasking.mask(rs.getString("user_id")));
+                row.put("user_ref", rs.getString("user_id_hmac") != null ? rs.getString("user_id_hmac").substring(0, 16) : null);
                 row.put("notified_at", rs.getTimestamp("notified_at").toInstant().toString());
                 result.add(row);
             }
