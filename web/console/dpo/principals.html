@@ -606,16 +606,37 @@
                 let detailsHtml = '';
                 const preferences = record.data_point_consents;
 
-                for (const purposeId in preferences) {
-                    const purpose = preferences[purposeId].purpose_agreed_to;
-                    const dataPointId = preferences[purposeId].data_point_id;
-                    const status = preferences[purposeId].consent_granted;
-                    const statusBadge = status === true
-                        ? `<span class="text-green-600 font-bold">GRANTED</span>`
-                        : `<span class="text-red-600 font-bold">DENIED</span>`;
-                    // Revoking an already-DENIED purpose is a no-op — only offer it for GRANTED ones.
-                    const revokeBtn = status === true
-                        ? `<button class="revoke-purpose-btn ml-3 text-xs text-red-600 hover:text-red-800 font-semibold underline" data-datapoint="${esc(dataPointId)}" data-purpose="${esc(purpose)}">Revoke</button>`
+                // Group by purpose_agreed_to — several data points (name, DOB, contact info, ...)
+                // commonly share one purpose, and a DPO thinks of "revoke" at the purpose level,
+                // not per individual field. One row + one Revoke button per distinct purpose;
+                // the button still withdraws every currently-granted data point under it in one call.
+                const byPurpose = {};
+                for (const key in preferences) {
+                    const dp = preferences[key];
+                    const purpose = dp.purpose_agreed_to;
+                    if (!byPurpose[purpose]) byPurpose[purpose] = { granted: [], anyGranted: false, anyDenied: false };
+                    if (dp.consent_granted === true) {
+                        byPurpose[purpose].granted.push(dp.data_point_id);
+                        byPurpose[purpose].anyGranted = true;
+                    } else {
+                        byPurpose[purpose].anyDenied = true;
+                    }
+                }
+
+                for (const purpose in byPurpose) {
+                    const group = byPurpose[purpose];
+                    let statusBadge;
+                    if (group.anyGranted && group.anyDenied) {
+                        statusBadge = `<span class="text-amber-600 font-bold">PARTIALLY GRANTED</span>`;
+                    } else if (group.anyGranted) {
+                        statusBadge = `<span class="text-green-600 font-bold">GRANTED</span>`;
+                    } else {
+                        statusBadge = `<span class="text-red-600 font-bold">DENIED</span>`;
+                    }
+                    // Revoking an already-DENIED purpose is a no-op — only offer it while at least
+                    // one data point under this purpose is still granted.
+                    const revokeBtn = group.anyGranted
+                        ? `<button class="revoke-purpose-btn ml-3 text-xs text-red-600 hover:text-red-800 font-semibold underline" data-datapoints="${esc(group.granted.join(','))}" data-purpose="${esc(purpose)}">Revoke</button>`
                         : '';
 
                     detailsHtml += `
@@ -627,7 +648,7 @@
                 }
                 granularConsentDetails.innerHTML = detailsHtml || '<p class="text-gray-500">No granular purposes recorded.</p>';
                 granularConsentDetails.querySelectorAll('.revoke-purpose-btn').forEach(btn => {
-                    btn.addEventListener('click', () => revokePurpose(recordId, btn.dataset.datapoint, btn.dataset.purpose));
+                    btn.addEventListener('click', () => revokePurpose(recordId, btn.dataset.datapoints.split(','), btn.dataset.purpose));
                 });
             }
         } catch (error) {
@@ -763,9 +784,12 @@
 
     // Revokes ONE purpose on a consent record — e.g. resolving a grievance that asked to stop
     // just one specific use of their data, without withdrawing everything (that's what the
-    // "Initiate Erasure Request" button above is for). Same reveal-then-act pattern as erasure:
-    // withdraw_consent needs a real user_id, not an opaque user_ref.
-    async function revokePurpose(recordId, dataPointId, purposeLabel) {
+    // "Initiate Erasure Request" button above is for). A purpose commonly covers several data
+    // points at once (name, DOB, contact info, ...), so dataPointIds is every currently-granted
+    // field under that one purpose — the whole purpose is revoked in a single call, not one
+    // field at a time. Same reveal-then-act pattern as erasure: withdraw_consent needs a real
+    // user_id, not an opaque user_ref.
+    async function revokePurpose(recordId, dataPointIds, purposeLabel) {
         let userId = currentUserId;
         if (!userId && currentUserRef) {
             try {
@@ -791,7 +815,7 @@
                 body: JSON.stringify({
                     "_func": "withdraw_consent",
                     "user_id": userId,
-                    "purpose_ids": [dataPointId],
+                    "purpose_ids": dataPointIds,
                     "reason": "DPO revoked a single purpose (e.g. via grievance resolution).",
                     "fiduciary_id": localStorage.getItem("fiduciary_id")
                 })
