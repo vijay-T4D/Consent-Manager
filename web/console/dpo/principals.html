@@ -722,12 +722,31 @@
             }
             const entry = await response.json();
             let purposesHtml = '';
+            // Group by purpose_agreed_to, same as the granular-consent-details section above —
+            // several data points commonly share one purpose, and one line per raw array entry
+            // made an identical purpose repeat once per field. List the covered field NAMES
+            // underneath — never the actual PII values, which this view never even has access to
+            // (data_point_id is always just a category label like "name", not real content).
+            const auditByPurpose = {};
             (entry.data_point_consents || []).forEach(dp => {
-                const badge = dp.consent_granted === true
-                    ? '<span class="text-green-600 font-bold">GRANTED</span>'
-                    : '<span class="text-red-600 font-bold">DENIED</span>';
-                purposesHtml += `<p class="ml-4">${esc(dp.purpose_agreed_to)}: ${badge}</p>`;
+                const purpose = dp.purpose_agreed_to;
+                if (!auditByPurpose[purpose]) auditByPurpose[purpose] = { fields: [], anyGranted: false, anyDenied: false };
+                auditByPurpose[purpose].fields.push(dp.data_point_id);
+                if (dp.consent_granted === true) auditByPurpose[purpose].anyGranted = true;
+                else auditByPurpose[purpose].anyDenied = true;
             });
+            for (const purpose in auditByPurpose) {
+                const group = auditByPurpose[purpose];
+                const badge = group.anyGranted && group.anyDenied
+                    ? '<span class="text-amber-600 font-bold">PARTIALLY GRANTED</span>'
+                    : group.anyGranted
+                        ? '<span class="text-green-600 font-bold">GRANTED</span>'
+                        : '<span class="text-red-600 font-bold">DENIED</span>';
+                purposesHtml += `
+                    <p class="ml-4">${esc(purpose)}: ${badge}</p>
+                    <p class="ml-8 text-xs text-gray-500">Fields: ${esc(group.fields.join(', '))}</p>
+                `;
+            }
             el.innerHTML = `
                 <p><strong>Logged at:</strong> ${esc(formatDateTime(entry.timestamp))}</p>
                 <p><strong>Hash:</strong> <code class="text-[10px] break-all">${esc(entry.current_hash)}</code></p>
