@@ -296,6 +296,12 @@
             <div id="provenance-details" class="policy-detail-card text-xs">
             </div>
 
+            <div id="guardian-verification-section" class="hidden">
+                <h3 class="font-semibold text-lg mt-4 border-b pb-1">Guardian Verification:</h3>
+                <div id="guardian-verification-details" class="policy-detail-card text-xs">
+                </div>
+            </div>
+
             <h3 class="font-semibold text-lg mt-4 border-b pb-1">Audit Trail:</h3>
             <div id="audit-trail-details" class="policy-detail-card text-xs">
                 <p class="text-gray-500">Loading...</p>
@@ -570,6 +576,7 @@
     async function viewConsentRecord(userId, recordId) {
         showModal();
         granularConsentDetails.innerHTML = `<p class="text-gray-500">Fetching record ${esc(recordId)}...</p>`;
+        document.getElementById('guardian-verification-section').classList.add('hidden');
 
         try {
             const payload = {
@@ -650,12 +657,85 @@
                 granularConsentDetails.querySelectorAll('.revoke-purpose-btn').forEach(btn => {
                     btn.addEventListener('click', () => revokePurpose(recordId, btn.dataset.datapoints.split(','), btn.dataset.purpose));
                 });
+
+                // Only minors' consent records carry a verification_log_id — most records won't,
+                // so the section stays hidden unless this one is actually linked to a guardian
+                // verification event.
+                if (record.verification_log_id) {
+                    document.getElementById('guardian-verification-section').classList.remove('hidden');
+                    loadGuardianVerification(record.verification_log_id);
+                }
             }
         } catch (error) {
             granularConsentDetails.innerHTML = `<p class="text-red-600">Error fetching details.</p>`;
         }
 
         loadConsentAuditTrail(recordId);
+    }
+
+    // Guardian-verification details for a minor's consent record — masked guardian_id + reveal
+    // (same pattern as the principal/IP reveal above), plus verification_ref_id/proof_metadata
+    // behind their own reveal (both come back together from one Pii.java call, source=
+    // parental_verification, same as consent_record's combined principal+IP reveal).
+    async function loadGuardianVerification(verificationId) {
+        const el = document.getElementById('guardian-verification-details');
+        el.innerHTML = '<p class="text-gray-500">Loading...</p>';
+        try {
+            const response = await fetch(API_URL_CONSENT, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({ "_func": "get_parental_verification", "id": verificationId, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+            });
+            if (!response.ok) {
+                el.innerHTML = '<p class="text-gray-500">No guardian verification record found.</p>';
+                return;
+            }
+            const v = await response.json();
+            el.innerHTML = `
+                <p><strong>Guardian:</strong> <span id="guardian-id-display">${esc(v.guardian_id)}</span>
+                   <button id="guardian-reveal-btn" class="text-xs" title="Reveal — this action is logged">👁</button></p>
+                <p><strong>Verified Via:</strong> ${esc(v.verification_mechanism)} (${esc(v.provider_name || 'N/A')})</p>
+                <p><strong>Verified At:</strong> ${esc(formatDateTime(v.verified_at))}</p>
+                <p><strong>Evidence Reference:</strong> <span id="guardian-ref-display">••••••••</span>
+                   <button id="guardian-ref-reveal-btn" class="text-xs" title="Reveal — this action is logged">👁</button></p>
+            `;
+            document.getElementById('guardian-reveal-btn').onclick = (e) => revealGuardianVerification(e.target, verificationId, 'guardian');
+            document.getElementById('guardian-ref-reveal-btn').onclick = (e) => revealGuardianVerification(e.target, verificationId, 'evidence');
+        } catch (e) {
+            el.innerHTML = '<p class="text-red-600">Error fetching guardian verification.</p>';
+        }
+    }
+
+    async function revealGuardianVerification(button, verificationId, which) {
+        if (!revealConfirmedThisSession) {
+            if (!confirm("This reveal will be recorded in the audit log against your account. Continue?")) return;
+            revealConfirmedThisSession = true;
+        }
+        try {
+            const response = await fetch(API_URL_PII, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({ "_func": "reveal_user_id", "source": "parental_verification", "id": verificationId, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+            });
+            const result = await response.json();
+            if (!response.ok) { alert("Reveal failed: " + (result.message || response.status)); return; }
+
+            if (which === 'guardian') {
+                document.getElementById('guardian-id-display').textContent = result.guardian_id || 'N/A';
+            } else {
+                const refText = result.verification_ref_id || 'N/A';
+                const proofText = result.proof_metadata ? ` | ${JSON.stringify(result.proof_metadata)}` : '';
+                document.getElementById('guardian-ref-display').textContent = refText + proofText;
+            }
+            // Auto-re-mask after 30s so a revealed value doesn't linger on-screen — same pattern
+            // used for the principal/IP reveal elsewhere in this file.
+            setTimeout(() => {
+                const el = document.getElementById(which === 'guardian' ? 'guardian-id-display' : 'guardian-ref-display');
+                if (el) el.textContent = which === 'guardian' ? '****' : '••••••••';
+            }, 30000);
+        } catch (e) {
+            alert("Error revealing guardian verification details.");
+        }
     }
 
     // Reveals BOTH principal and IP for a consent_record in one audited call (Pii.java returns

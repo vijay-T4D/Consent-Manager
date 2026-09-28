@@ -206,6 +206,24 @@ public class Consent implements Action {
                     }
                     break;
 
+                case "get_parental_verification":
+                    // Masked read of the guardian-verification event a minor's consent record
+                    // was linked to via verification_log_id. Never returns verification_ref_id
+                    // or proof_metadata — those stay behind Pii.java's audited reveal, same as
+                    // every other encrypted evidence field in this system.
+                    String verificationId = (String) input.get("id");
+                    if (verificationId == null || fiduciaryId == null) {
+                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_BAD_REQUEST, "Bad Request", "'id' and 'fiduciary_id' are required for 'get_parental_verification'.", req.getRequestURI());
+                        return;
+                    }
+                    Optional<JSONObject> verificationOptional = getParentalVerificationFromDb(UUID.fromString(verificationId), fiduciaryId);
+                    if (verificationOptional.isPresent()) {
+                        OutputProcessor.send(res, HttpServletResponse.SC_OK, verificationOptional.get());
+                    } else {
+                        OutputProcessor.errorResponse(res, HttpServletResponse.SC_NOT_FOUND, "Not Found", "No guardian verification found for the given 'id'.", req.getRequestURI());
+                    }
+                    break;
+
                 case "get_consent_audit_trail":
                     // Cross-references a live consent_records row against its own tamper-evident
                     // audit_logs entry (matched via the consent_record_id embedded in that entry's
@@ -1003,7 +1021,7 @@ public class Consent implements Action {
         String sql = "SELECT cr.id, " + DbEncryption.decryptCol("cr.user_id_enc") + " AS user_id, cr.user_id_hmac, cr.fiduciary_id, cr.policy_id, cr.policy_version, cr.timestamp, " +
                 "cr.jurisdiction, cr.language_selected, cr.consent_status_general, cr.consent_mechanism, " +
                 DbEncryption.decryptCol("cr.ip_address_enc") + " AS ip_address, cr.user_agent, cr.data_point_consents, cr.is_active_consent, " +
-                "cr.ropa_entry_id, re.activity_name AS ropa_activity_name " +
+                "cr.ropa_entry_id, re.activity_name AS ropa_activity_name, cr.verification_log_id " +
                 "FROM consent_records cr " +
                 "LEFT JOIN ropa_entries re ON re.id = cr.ropa_entry_id " +
                 "WHERE cr.id = ?";
@@ -1036,10 +1054,50 @@ public class Consent implements Action {
                 Object ropaId = rs.getObject("ropa_entry_id");
                 consent.put("ropa_entry_id", ropaId != null ? ropaId.toString() : null);
                 consent.put("ropa_activity_name", rs.getString("ropa_activity_name"));
+                Object verificationLogId = rs.getObject("verification_log_id");
+                consent.put("verification_log_id", verificationLogId != null ? verificationLogId.toString() : null);
                 return Optional.of(consent);
             }
         } catch (ParseException e) {
             throw new SQLException("Failed to parse data_point_consents JSON from DB: " + e.getMessage(), e);
+        } finally {
+            pool.cleanup(rs, pstmt, conn);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Masked read of one parental_verification_logs row, for display alongside a minor's
+     * consent record. guardian_id is decrypted then masked (PII, but this operator didn't
+     * supply it — same masking rule as user_id/ip_address elsewhere). verification_ref_id
+     * and proof_metadata are deliberately NOT returned here — those stay behind Pii.java's
+     * audited reveal (source=parental_verification), same protection level as everywhere
+     * else evidence pointers are stored.
+     */
+    private Optional<JSONObject> getParentalVerificationFromDb(UUID verificationId, UUID fiduciaryId) throws SQLException {
+        Connection conn = null;
+        PreparedStatement pstmt = null;
+        ResultSet rs = null;
+        PoolDB pool = new PoolDB();
+        String sql = "SELECT id, " + DbEncryption.decryptCol("guardian_principal_id_enc") + " AS guardian_id, " +
+                "verification_mechanism, provider_name, verified_at " +
+                "FROM parental_verification_logs WHERE id = ? AND fiduciary_id = ?";
+        try {
+            conn = pool.getConnection();
+            pstmt = conn.prepareStatement(sql);
+            int idx = DbEncryption.bindKey(pstmt, 1); // guardian_id decryptCol key
+            pstmt.setObject(idx++, verificationId);
+            pstmt.setObject(idx, fiduciaryId);
+            rs = pstmt.executeQuery();
+            if (rs.next()) {
+                JSONObject verification = new JSONObject();
+                verification.put("id", rs.getString("id"));
+                verification.put("guardian_id", PiiMasking.mask(rs.getString("guardian_id")));
+                verification.put("verification_mechanism", rs.getString("verification_mechanism"));
+                verification.put("provider_name", rs.getString("provider_name"));
+                verification.put("verified_at", rs.getTimestamp("verified_at").toInstant().toString());
+                return Optional.of(verification);
+            }
         } finally {
             pool.cleanup(rs, pstmt, conn);
         }

@@ -67,13 +67,15 @@ public class Pii implements Action {
         SOURCE_MAP.put("grievance",      new SourceSpec("grievances", "id", USER_ID_FIELD, "user_id_enc"));
         SOURCE_MAP.put("purge_request",  new SourceSpec("purge_requests", "id", USER_ID_FIELD, "user_id_enc"));
         SOURCE_MAP.put("data_principal", new SourceSpec("data_principal", null, USER_ID_FIELD, "user_id_enc"));
-        // Guardian-verification evidence: verification_ref_id (meant to be an opaque pointer,
-        // e.g. an S3 key for a scanned document) and proof_metadata (descriptive-only JSON) — both
-        // encrypted because nothing stops a caller from putting real identity-document data
-        // straight into either field. Audit subject is the child principal, not either evidence
-        // field, matching how every other reveal ties back to a Data Principal.
+        // Guardian-verification evidence: guardian_id (the parent/guardian's own identifier),
+        // verification_ref_id (meant to be an opaque pointer, e.g. an S3 key for a scanned
+        // document), and proof_metadata (descriptive-only JSON) — all encrypted, guardian_id
+        // because it's PII the console never has the caller's own plaintext for, the other two
+        // because nothing stops a caller from putting real identity-document data straight into
+        // either field. Audit subject is the child principal, not any of these three fields,
+        // matching how every other reveal ties back to a Data Principal.
         SOURCE_MAP.put("parental_verification", new SourceSpec("parental_verification_logs", "id",
-                new String[][]{{"verification_ref_id_enc", "verification_ref_id"}, {"proof_metadata_enc", "proof_metadata"}},
+                new String[][]{{"guardian_principal_id_enc", "guardian_id"}, {"verification_ref_id_enc", "verification_ref_id"}, {"proof_metadata_enc", "proof_metadata"}},
                 "child_principal_id_enc"));
     }
 
