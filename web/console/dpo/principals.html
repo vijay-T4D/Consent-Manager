@@ -339,8 +339,10 @@
     // --- Configuration ---
     const API_URL_CONSENT = '/api/v1/consent';
     const API_URL_PII = '/api/v1/pii';
+    const API_URL_APP = '/api/v1/admin/app';
     const AUTH_TOKEN = localStorage.getItem('authToken');
     let revealConfirmedThisSession = false;
+    const appNameCache = {}; // app_id -> name, avoids re-fetching on every audit-trail load
 
     // --- PII reveal helper (shared shape across principals/grievances/compliance) ---
     // Every reveal is server-side audit-logged (Pii.java, synchronously flushed before
@@ -784,6 +786,30 @@
         }
     }
 
+    // Resolves an audit-log service_type/service_id pair into a human-readable label. For "APP"
+    // entries (a consent submitted through a fiduciary's own integration), looks up the actual
+    // app name — service_id is otherwise just an opaque UUID, not meaningful on its own. Other
+    // service types (DPO_CONSOLE, SYSTEM, ADMIN_CONSOLE) already read fine as-is, no lookup needed.
+    async function resolveServiceLabel(serviceType, serviceId) {
+        if (!serviceType) return 'Unknown';
+        if (serviceType !== 'APP' || !serviceId) return serviceType;
+        if (appNameCache[serviceId]) return appNameCache[serviceId];
+        try {
+            const response = await fetch(API_URL_APP, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                body: JSON.stringify({ "_func": "get_app", "app_id": serviceId, "fiduciary_id": localStorage.getItem("fiduciary_id") })
+            });
+            if (!response.ok) return `App (${serviceId})`;
+            const app = await response.json();
+            const label = app.name ? `${app.name} (App)` : `App (${serviceId})`;
+            appNameCache[serviceId] = label;
+            return label;
+        } catch (e) {
+            return `App (${serviceId})`;
+        }
+    }
+
     // Independent, tamper-evident cross-check: pulls the audit_logs entry for this consent (not
     // the live consent_records row) so a DPO can see what was actually logged as consented at
     // the time, verified via the hash chain — see Consent.getConsentAuditEntryFromDb.
@@ -827,8 +853,10 @@
                     <p class="ml-8 text-xs text-gray-500">Fields: ${esc(group.fields.join(', '))}</p>
                 `;
             }
+            const submittedVia = await resolveServiceLabel(entry.service_type, entry.service_id);
             el.innerHTML = `
                 <p><strong>Logged at:</strong> ${esc(formatDateTime(entry.timestamp))}</p>
+                <p><strong>Submitted Via:</strong> ${esc(submittedVia)}</p>
                 <p><strong>Hash:</strong> <code class="text-[10px] break-all">${esc(entry.current_hash)}</code></p>
                 <p class="mt-2 font-medium">What the audit log recorded as consented:</p>
                 ${purposesHtml || '<p class="ml-4 text-gray-500">No purposes recorded.</p>'}

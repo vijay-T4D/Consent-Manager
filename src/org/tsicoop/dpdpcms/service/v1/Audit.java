@@ -341,6 +341,8 @@ public class Audit implements Action {
                 log.put("timestamp", rs.getTimestamp("timestamp").toInstant().toString());
                 log.put("user_id", rs.getString("user_id"));
                 log.put("service_type", rs.getString("service_type"));
+                Object listServiceId = rs.getObject("service_id");
+                log.put("service_id", listServiceId != null ? listServiceId.toString() : null);
                 log.put("audit_action", rs.getString("audit_action"));
                 log.put("context_details", rs.getString("context_details"));
                 log.put("current_hash", rs.getString("current_log_hash")); // Exposed for auditor verification
@@ -379,6 +381,8 @@ public class Audit implements Action {
                 log.put("timestamp", rs.getTimestamp("timestamp").toInstant().toString());
                 log.put("user_id", rs.getString("user_id"));
                 log.put("service_type", rs.getString("service_type"));
+                Object entryServiceId = rs.getObject("service_id");
+                log.put("service_id", entryServiceId != null ? entryServiceId.toString() : null);
                 log.put("audit_action", rs.getString("audit_action"));
                 log.put("prev_hash", rs.getString("prev_log_hash"));
                 log.put("current_hash", rs.getString("current_log_hash"));

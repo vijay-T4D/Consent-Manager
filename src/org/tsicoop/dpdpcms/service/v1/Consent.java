@@ -1131,7 +1131,7 @@ public class Consent implements Action {
         ResultSet rs = null;
         try {
             conn = pool.getConnection();
-            String sql = "SELECT timestamp, current_log_hash, prev_log_hash, context_details FROM " +
+            String sql = "SELECT timestamp, current_log_hash, prev_log_hash, context_details, service_type, service_id FROM " +
                     Audit.auditLogsUnionSource(conn) +
                     " WHERE audit_action = 'CONSENT_GIVEN' AND fiduciary_id = ? AND context_details LIKE ? " +
                     "ORDER BY timestamp DESC LIMIT 1";
@@ -1144,6 +1144,9 @@ public class Consent implements Action {
                 entry.put("timestamp", rs.getTimestamp("timestamp").toInstant().toString());
                 entry.put("current_hash", rs.getString("current_log_hash"));
                 entry.put("prev_hash", rs.getString("prev_log_hash"));
+                entry.put("service_type", rs.getString("service_type"));
+                Object serviceId = rs.getObject("service_id");
+                entry.put("service_id", serviceId != null ? serviceId.toString() : null);
                 try {
                     JSONObject context = (JSONObject) new JSONParser().parse(rs.getString("context_details"));
                     entry.put("policy_id", context.get("policy_id"));
