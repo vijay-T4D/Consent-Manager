@@ -132,7 +132,7 @@ public class Consent implements Action {
             switch (func.toLowerCase()) {
                 case "record_consent": // Used for initial grant, update, or withdrawal
                     String policyId = (String) input.get("policy_id");
-                    String policyVersion = "";
+                    String policyVersion = input.get("policy_version") != null ? (String) input.get("policy_version") : "";
                     String timestampStr = (String) input.get("timestamp");
                     String jurisdiction = "IN";
                     String languageSelected = input.get("language_selected")!=null?(String) input.get("language_selected"):"en";
